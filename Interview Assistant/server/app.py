@@ -153,6 +153,7 @@ async def admin_extend(body: dict):
     days = int(body.get("days", PERIOD_DAYS))
     c = db()
     row = c.execute("SELECT current_period_end FROM licenses WHERE key=?", (key,)).fetchone()
+    created = row is None
     if not row:
         c.execute("INSERT INTO licenses(key,hwid,status,current_period_end,created) VALUES(?,'', 'active',0,?)",
                   (key, int(time.time())))
@@ -163,7 +164,26 @@ async def admin_extend(body: dict):
     c.execute("UPDATE licenses SET status='active', current_period_end=? WHERE key=?", (new_end, key))
     c.commit()
     c.close()
-    return {"ok": True, "exp": new_end}
+    return {"ok": True, "exp": new_end, "created": created}
+
+
+@app.post("/admin/lookup")
+async def admin_lookup(body: dict):
+    """Read-only ground truth: does this exact key exist? No side effects."""
+    token = os.getenv("ADMIN_TOKEN", "")
+    if not token or not secrets.compare_digest(str(body.get("admin_token", "")), token):
+        raise HTTPException(401, "bad admin token")
+    key = (body.get("key") or "").strip()
+    c = db()
+    row = c.execute("SELECT status, current_period_end, hwid FROM licenses WHERE key=?", (key,)).fetchone()
+    n = c.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
+    c.close()
+    if not row:
+        return {"exists": False, "total_keys": n}
+    status, end, hwid = row
+    return {"exists": True, "status": status, "exp": int(end),
+            "active_now": status == "active" and int(end) > int(time.time()),
+            "bound": bool(hwid), "total_keys": n}
 
 
 def _check(key: str, hwid: str) -> tuple[bool, str, int]:
