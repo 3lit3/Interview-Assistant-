@@ -44,6 +44,21 @@ MOCK = os.getenv("MOCK_NOWPAYMENTS", "1") == "1"  # default mock until keys set
 app = FastAPI(title="InterviewAssistant License Server")
 
 
+@app.on_event("startup")
+async def _log_mode():
+    # Safe: logs mode only, never secrets. Visible in Render -> Logs.
+    print(f"[license] mode={'MOCK' if MOCK else 'LIVE'} price={PRICE}{CURRENCY} "
+          f"api_key_set={bool(NOW_API)} ipn_secret_set={bool(NOW_IPN_SECRET)}", flush=True)
+
+
+@app.get("/status")
+async def status():
+    """Safe diagnostic: mode flags only, no secrets, no keys."""
+    return {"mode": "mock" if MOCK else "live",
+            "api_key_set": bool(NOW_API), "ipn_secret_set": bool(NOW_IPN_SECRET),
+            "price": PRICE, "currency": CURRENCY, "days": PERIOD_DAYS}
+
+
 def db() -> sqlite3.Connection:
     c = sqlite3.connect(DB)
     c.execute("""CREATE TABLE IF NOT EXISTS licenses(
