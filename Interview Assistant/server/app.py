@@ -80,9 +80,15 @@ def nowpayments_invoice(order_id: str) -> str:
     payload = {
         "price_amount": PRICE, "price_currency": CURRENCY,
         "order_id": order_id, "order_description": "Interview Assistant $9.99/mo, 1 seat",
-        "ipn_callback_url": os.getenv("IPN_CALLBACK_URL", ""),
-        "success_url": os.getenv("SUCCESS_URL", ""), "cancel_url": os.getenv("CANCEL_URL", ""),
     }
+    # NOWPayments rejects empty-string optionals (400 INVALID_REQUEST_PARAMS),
+    # so only send URLs that are actually configured.
+    for field, env in (("ipn_callback_url", "IPN_CALLBACK_URL"),
+                       ("success_url", "SUCCESS_URL"),
+                       ("cancel_url", "CANCEL_URL")):
+        val = os.getenv(env, "").strip()
+        if val:
+            payload[field] = val
     req = urllib.request.Request(
         "https://api.nowpayments.io/v1/invoice",
         data=json.dumps(payload).encode(),
