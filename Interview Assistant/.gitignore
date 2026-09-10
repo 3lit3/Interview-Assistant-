@@ -1,0 +1,13 @@
+# Secrets - never commit live keys or customer data
+.env
+server/.env
+server/licenses.db
+GUI/license_server.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+ass_env/
+win_env/
+ass/

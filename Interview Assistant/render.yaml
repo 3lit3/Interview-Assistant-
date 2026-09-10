@@ -1,0 +1,26 @@
+# Render.com one-click deploy for the license server.
+# New Web Service -> this repo. Render reads this file automatically.
+services:
+  - type: web
+    name: interview-license-server
+    runtime: python
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PRICE_USD
+        value: 9.99
+      - key: PRICE_CURRENCY
+        value: USD
+      - key: MOCK_NOWPAYMENTS
+        value: 0
+      - key: NOWPAYMENTS_API_KEY
+        sync: false
+      - key: NOWPAYMENTS_IPN_SECRET
+        sync: false
+      - key: IPN_CALLBACK_URL
+        sync: false
+      - key: SUCCESS_URL
+        sync: false
+      - key: CANCEL_URL
+        sync: false
