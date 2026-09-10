@@ -125,12 +125,45 @@ async def invoice(body: dict):
 def _extend(key: str) -> int:
     c = db()
     row = c.execute("SELECT current_period_end FROM licenses WHERE key=?", (key,)).fetchone()
-    base = max(int(time.time()), int(row[0]) if row else 0)
+    if not row:
+        # Recovery path: key paid but row lost (e.g. free-tier disk wipe).
+        # Recreate it; hwid stays empty so the buyer's device binds on Activate.
+        c.execute("INSERT INTO licenses(key,hwid,status,current_period_end,created) VALUES(?,'', 'active',0,?)",
+                  (key, int(time.time())))
+        base = 0
+    else:
+        base = int(row[0])
+    base = max(int(time.time()), base)
     new_end = base + PERIOD_DAYS * 86400
     c.execute("UPDATE licenses SET status='active', current_period_end=? WHERE key=?", (new_end, key))
     c.commit()
     c.close()
     return new_end
+
+
+@app.post("/admin/extend")
+async def admin_extend(body: dict):
+    """Manual support tool (refunds/recovery). Needs ADMIN_TOKEN env on server."""
+    token = os.getenv("ADMIN_TOKEN", "")
+    if not token or not secrets.compare_digest(str(body.get("admin_token", "")), token):
+        raise HTTPException(401, "bad admin token")
+    key = (body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(400, "key required")
+    days = int(body.get("days", PERIOD_DAYS))
+    c = db()
+    row = c.execute("SELECT current_period_end FROM licenses WHERE key=?", (key,)).fetchone()
+    if not row:
+        c.execute("INSERT INTO licenses(key,hwid,status,current_period_end,created) VALUES(?,'', 'active',0,?)",
+                  (key, int(time.time())))
+        base = 0
+    else:
+        base = int(row[0])
+    new_end = max(int(time.time()), base) + days * 86400
+    c.execute("UPDATE licenses SET status='active', current_period_end=? WHERE key=?", (new_end, key))
+    c.commit()
+    c.close()
+    return {"ok": True, "exp": new_end}
 
 
 def _check(key: str, hwid: str) -> tuple[bool, str, int]:

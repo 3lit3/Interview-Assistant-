@@ -111,8 +111,15 @@ def save_cache(data: dict) -> None:
 
 def verify_with_server(key: str, hwid: str) -> tuple[bool, str, int]:
     """Returns (ok, message, exp_epoch)."""
+    import urllib.error
+
     try:
         resp = _post("/verify", {"key": key, "hwid": hwid})
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False, ("Key not found on server (free-tier restart likely wiped test data). "
+                           "Do NOT pay again — contact support with your key."), 0
+        return False, f"License server error HTTP {exc.code}", 0
     except Exception as exc:
         # Offline: honor cache within grace window (clock could be forged;
         # server re-check every REVERIFY_MINUTES limits abuse window).
