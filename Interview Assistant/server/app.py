@@ -87,8 +87,18 @@ def nowpayments_invoice(order_id: str) -> str:
         "https://api.nowpayments.io/v1/invoice",
         data=json.dumps(payload).encode(),
         headers={"x-api-key": NOW_API, "Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode())["invoice_url"]
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = json.loads(r.read().decode())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()[:500]
+        raise HTTPException(status_code=502,
+                            detail=f"NOWPayments rejected invoice (HTTP {exc.code}): {detail}")
+    try:
+        return body["invoice_url"]
+    except KeyError:
+        raise HTTPException(status_code=502,
+                            detail=f"NOWPayments gave no invoice_url: {json.dumps(body)[:500]}")
 
 
 @app.post("/invoice")
