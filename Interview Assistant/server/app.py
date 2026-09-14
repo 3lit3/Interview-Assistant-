@@ -1,23 +1,18 @@
-"""License server stub: $9.99/mo, 1 seat per key, NOWPayments-backed.
+"""License + key-issuance server: $9.99/mo, 1 seat per key, NOWPayments-backed.
 
 Endpoints:
-  POST /invoice  {hwid, plan} -> {key, invoice_url}   (creates pending key)
-  POST /ipn      (NOWPayments webhook, HMAC-verified) -> extends 30 days
-  POST /activate {key, hwid} -> binds device on first use, checks sub active
-  POST /verify   {key, hwid} -> same as activate (called at startup + 30min)
+  POST /invoice   {hwid, plan} -> {key, invoice_url}
+  POST /ipn       (NOWPayments webhook, HMAC-verified) -> extends 30 days
+  POST /activate  {key, hwid} -> binds device on first use, checks sub active
+  POST /verify    {key, hwid} -> same as activate (called at startup + 30min)
+  POST /issue-key {key, hwid} -> {blob, verification, algo} (encrypted LLM key)
 
-Setup (NOWPayments dashboard):
-  1. Get API key + IPN secret.
-  2. Set IPN callback URL to https://YOURHOST/ipn
-  3. env: NOWPAYMENTS_API_KEY, NOWPAYMENTS_IPN_SECRET (see .env.example)
+New: /issue-key encrypts the real LLM API key per-device using AES-256-CBC.
+The client decrypts it locally and uses it for all LLM calls. The key is never
+sent in plaintext. Env var LLM_API_KEY holds the real key on the server.
+Env var KEY_ISSUANCE_SECRET is the AES encryption master secret.
 
 Run:  uvicorn app:app --port 8000   (from server/ dir)
-Test without NOWPayments keys: MOCK_NOWPAYMENTS=1 -> /invoice returns a
-fake pay URL and /ipn can be simulated via POST /simulate_pay {key}.
-
-Billing model: each confirmed $9.99 payment extends current_period_end by
-30 days. No auto-rebill (crypto has no chargeable token) — user pays a new
-invoice each month via /invoice using their existing key.
 """
 from __future__ import annotations
 
@@ -33,29 +28,34 @@ import urllib.request
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from crypto_utils import issue_encrypted_key
+
 DB = os.path.join(os.path.dirname(__file__), "licenses.db")
 PRICE = float(os.getenv("PRICE_USD", "9.99"))
 CURRENCY = os.getenv("PRICE_CURRENCY", "USD")
 PERIOD_DAYS = 30
 NOW_API = os.getenv("NOWPAYMENTS_API_KEY", "")
 NOW_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
-MOCK = os.getenv("MOCK_NOWPAYMENTS", "1") == "1"  # default mock until keys set
+MOCK = os.getenv("MOCK_NOWPAYMENTS", "1") == "1"
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+KEY_ISSUANCE_SECRET = os.getenv("KEY_ISSUANCE_SECRET", "")
 
-app = FastAPI(title="InterviewAssistant License Server")
+app = FastAPI(title="InterviewAssistant License + Key Server")
 
 
 @app.on_event("startup")
 async def _log_mode():
-    # Safe: logs mode only, never secrets. Visible in Render -> Logs.
     print(f"[license] mode={'MOCK' if MOCK else 'LIVE'} price={PRICE}{CURRENCY} "
-          f"api_key_set={bool(NOW_API)} ipn_secret_set={bool(NOW_IPN_SECRET)}", flush=True)
+          f"api_key_set={bool(NOW_API)} ipn_secret_set={bool(NOW_IPN_SECRET)} "
+          f"llm_key_set={bool(LLM_API_KEY)} key_secret_set={bool(KEY_ISSUANCE_SECRET)}",
+          flush=True)
 
 
 @app.get("/status")
 async def status():
-    """Safe diagnostic: mode flags only, no secrets, no keys."""
     return {"mode": "mock" if MOCK else "live",
             "api_key_set": bool(NOW_API), "ipn_secret_set": bool(NOW_IPN_SECRET),
+            "llm_key_set": bool(LLM_API_KEY), "key_secret_set": bool(KEY_ISSUANCE_SECRET),
             "price": PRICE, "currency": CURRENCY, "days": PERIOD_DAYS}
 
 
@@ -74,15 +74,12 @@ def new_key() -> str:
 
 
 def nowpayments_invoice(order_id: str) -> str:
-    """Real NOWPayments invoice; falls back to mock URL when no API key."""
     if not NOW_API or MOCK:
         return f"http://127.0.0.1:8000/pay/MOCK-{order_id} (set NOWPAYMENTS_API_KEY for real link)"
     payload = {
         "price_amount": PRICE, "price_currency": CURRENCY,
         "order_id": order_id, "order_description": "Interview Assistant $9.99/mo, 1 seat",
     }
-    # NOWPayments rejects empty-string optionals (400 INVALID_REQUEST_PARAMS),
-    # so only send URLs that are actually configured.
     for field, env in (("ipn_callback_url", "IPN_CALLBACK_URL"),
                        ("success_url", "SUCCESS_URL"),
                        ("cancel_url", "CANCEL_URL")):
@@ -110,7 +107,7 @@ def nowpayments_invoice(order_id: str) -> str:
 @app.post("/invoice")
 async def invoice(body: dict):
     hwid = (body.get("hwid") or "")[:64]
-    key = (body.get("key") or "").strip() or new_key()  # renewal: pass existing key
+    key = (body.get("key") or "").strip() or new_key()
     c = db()
     row = c.execute("SELECT key FROM licenses WHERE key=?", (key,)).fetchone()
     if not row:
@@ -126,8 +123,6 @@ def _extend(key: str) -> int:
     c = db()
     row = c.execute("SELECT current_period_end FROM licenses WHERE key=?", (key,)).fetchone()
     if not row:
-        # Recovery path: key paid but row lost (e.g. free-tier disk wipe).
-        # Recreate it; hwid stays empty so the buyer's device binds on Activate.
         c.execute("INSERT INTO licenses(key,hwid,status,current_period_end,created) VALUES(?,'', 'active',0,?)",
                   (key, int(time.time())))
         base = 0
@@ -143,7 +138,6 @@ def _extend(key: str) -> int:
 
 @app.post("/admin/extend")
 async def admin_extend(body: dict):
-    """Manual support tool (refunds/recovery). Needs ADMIN_TOKEN env on server."""
     token = os.getenv("ADMIN_TOKEN", "")
     if not token or not secrets.compare_digest(str(body.get("admin_token", "")), token):
         raise HTTPException(401, "bad admin token")
@@ -169,7 +163,6 @@ async def admin_extend(body: dict):
 
 @app.post("/admin/lookup")
 async def admin_lookup(body: dict):
-    """Read-only ground truth: does this exact key exist? No side effects."""
     token = os.getenv("ADMIN_TOKEN", "")
     if not token or not secrets.compare_digest(str(body.get("admin_token", "")), token):
         raise HTTPException(401, "bad admin token")
@@ -211,7 +204,7 @@ async def activate(body: dict):
         c.close()
         raise HTTPException(404, "unknown key")
     if not row[0]:
-        c.execute("UPDATE licenses SET hwid=? WHERE key=?", (hwid, key))  # first bind
+        c.execute("UPDATE licenses SET hwid=? WHERE key=?", (hwid, key))
         c.commit()
     c.close()
     ok, msg, end = _check(key, hwid)
@@ -220,13 +213,43 @@ async def activate(body: dict):
 
 @app.post("/verify")
 async def verify(body: dict):
-    return await activate(body)  # same policy: bound device + active period
+    return await activate(body)
+
+
+@app.post("/issue-key")
+async def issue_key(body: dict):
+    """Issue an encrypted LLM API key for a verified device.
+
+    Client calls this at every startup after license verification.
+    Returns AES-256-CBC encrypted blob that only decrypts on the
+    requesting device (HWID-bound).
+    """
+    key = (body.get("key") or "").strip()
+    hwid = (body.get("hwid") or "").strip()
+    if not key or not hwid:
+        raise HTTPException(400, "key + hwid required")
+
+    if not LLM_API_KEY:
+        raise HTTPException(500, "LLM_API_KEY not configured on server")
+    if not KEY_ISSUANCE_SECRET:
+        raise HTTPException(500, "KEY_ISSUANCE_SECRET not configured on server")
+
+    ok, msg, _ = _check(key, hwid)
+    if not ok:
+        raise HTTPException(403, f"license invalid: {msg}")
+
+    try:
+        result = issue_encrypted_key(hwid, LLM_API_KEY)
+    except Exception as exc:
+        raise HTTPException(500, f"key issuance failed: {exc}")
+
+    return {"ok": True, **result}
 
 
 @app.post("/ipn")
 async def ipn(req: Request, x_nowpayments_sig: str = Header(default="", alias="x-nowpayments-sig")):
     raw = await req.body()
-    if NOW_IPN_SECRET:  # NOWPayments signs sorted-JSON with IPN secret
+    if NOW_IPN_SECRET:
         try:
             data = json.loads(raw)
             sig = hmac.new(NOW_IPN_SECRET.encode(),
@@ -252,7 +275,7 @@ async def ipn(req: Request, x_nowpayments_sig: str = Header(default="", alias="x
     return JSONResponse({"ok": True})
 
 
-@app.post("/simulate_pay")  # mock helper until NOWPayments keys are set
+@app.post("/simulate_pay")
 async def simulate_pay(body: dict):
     if not MOCK:
         raise HTTPException(403, "disabled when MOCK_NOWPAYMENTS=0")
