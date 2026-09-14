@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv/
+venv/
+server/.env
+client/.env
+
+# License DB
+server/licenses.db
+
+# Build artifacts
+client/dist/
+client/build/
+client/*.spec
+
+# OS files
+.DS_Store
+Thumbs.db
