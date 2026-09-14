@@ -45,7 +45,10 @@ app = FastAPI(title="InterviewAssistant Server")
 
 @contextmanager
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    url = DATABASE_URL
+    if "sslmode" not in url:
+        url += "?sslmode=require"
+    conn = psycopg2.connect(url)
     try:
         yield conn
         conn.commit()
