@@ -1,5 +1,4 @@
-# Render.com one-click deploy for the license server.
-# New Web Service -> this repo. Render reads this file automatically.
+# Render.com one-click deploy for the license + key-issuance server.
 services:
   - type: web
     name: interview-license-server
@@ -29,4 +28,8 @@ services:
       - key: LLM_API_KEY
         sync: false
       - key: KEY_ISSUANCE_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
