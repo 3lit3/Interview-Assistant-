@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
+
 import numpy as np
 
 from config import Config
@@ -13,7 +15,7 @@ try:
     from pywhispercpp.model import Model as CppModel
 
     _HAS_CPP = True
-except Exception:
+except Exception:  # pragma: no cover - optional dependency
     _HAS_CPP = False
 
 
@@ -27,6 +29,15 @@ class VADSegmenter:
         self.max_frames = int(cfg.max_utterance_ms / cfg.vad_frame_ms)
         self.partial_frames = max(1, int(cfg.partial_interval * 1000 / cfg.vad_frame_ms))
         self.noise_floor: float | None = None
+        # Rolling minimum of recent non-speech RMS = noise floor. Seeding the
+        # floor from a single frame (old behaviour) locked it to speech or to
+        # a beep whenever recording started mid-sentence, making the detector
+        # deaf for the rest of the session.
+        self._hist_frames = max(1, int(3000 / cfg.vad_frame_ms))
+        self._rms_hist: deque[float] = deque()
+        # First 1.5s: gate on the absolute floor only, so a session that
+        # starts mid-sentence is not silenced by its own opening words.
+        self._warmup_left = max(1, int(1500 / cfg.vad_frame_ms))
         self._buf = np.zeros(0, dtype="<i2")
         self._cur: list[np.ndarray] = []
         self._in_speech = False
@@ -36,12 +47,47 @@ class VADSegmenter:
 
     def _is_speech(self, frame: np.ndarray) -> bool:
         rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2) + 1e-9))
+        if not self._in_speech:
+            self._rms_hist.append(rms)
+            while len(self._rms_hist) > self._hist_frames:
+                self._rms_hist.popleft()
+            self.noise_floor = min(self._rms_hist)
         if self.noise_floor is None:
             self.noise_floor = rms
-        elif not self._in_speech:
-            self.noise_floor = 0.999 * self.noise_floor + 0.001 * rms
-        threshold = max(self.noise_floor * self.cfg.vad_noise_multiplier, self.cfg.vad_min_rms)
-        return rms > threshold
+        if self._warmup_left > 0:
+            self._warmup_left -= 1
+            threshold = float(self.cfg.vad_min_rms)
+        else:
+            # Cap: a polluted floor must never be able to deafen the detector.
+            threshold = min(
+                max(self.noise_floor * self.cfg.vad_noise_multiplier, self.cfg.vad_min_rms),
+                self.cfg.vad_min_rms * 8.0,
+            )
+        if rms <= threshold:
+            return False
+        # Notification dings / DTMF / system beeps are loud but not speech.
+        return not self._is_tone(frame)
+
+    @staticmethod
+    def _is_tone(frame: np.ndarray) -> bool:
+        """True for pure tones (beeps, dings, feedback howl) — never speech.
+
+        A sine parks ~all of its energy in a couple of FFT bins (ratio ~1.0),
+        while even a strongly voiced vowel spreads across many harmonics
+        (measured < 0.85). The threshold sits well above real speech so a
+        loud voice can never be mistaken for a tone.
+        """
+        f = frame.astype(np.float32)
+        n = len(f)
+        if n < 64:
+            return False
+        f = f - float(f.mean())
+        spec = np.abs(np.fft.rfft(f * np.hanning(n))) ** 2
+        total = float(spec.sum())
+        if total <= 0:
+            return False
+        top3 = float(np.sort(spec)[-3:].sum())
+        return top3 / total > 0.92
 
     def feed(self, pcm: np.ndarray):
         self._buf = np.concatenate([self._buf, pcm])
@@ -49,7 +95,7 @@ class VADSegmenter:
         partial: np.ndarray | None = None
         while len(self._buf) >= self.frame_samples:
             frame = self._buf[: self.frame_samples]
-            self._buf = self._buf[self.frame_samples:]
+            self._buf = self._buf[self.frame_samples :]
             is_speech = self._is_speech(frame)
 
             if is_speech:
@@ -69,13 +115,15 @@ class VADSegmenter:
                 ):
                     partial = np.concatenate(self._cur)
                     self._since_partial = 0
+                # Checked while still in speech: the old placement (silence
+                # branch) made MAX_UTTERANCE_MS unreachable.
+                if self._speech_frames >= self.max_frames:
+                    self._flush(utterances)
             else:
                 if self._in_speech:
                     self._silence_count += 1
                     if self._silence_count >= self.silence_frames:
                         self._flush(utterances)
-                if self._in_speech and self._speech_frames >= self.max_frames:
-                    self._flush(utterances)
         return utterances, partial
 
     def _flush(self, out: list[np.ndarray]):
@@ -135,8 +183,9 @@ class STTEngine:
         segments, _ = self.model.transcribe(
             audio_f,
             language="en",
-            vad_filter=False,
-            beam_size=1,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 400, "threshold": 0.5},
+            beam_size=self.cfg.stt_beam_size,
             best_of=1,
             temperature=[0.0, 0.5, 1.0],
             condition_on_previous_text=False,
@@ -152,10 +201,13 @@ class STTEngine:
             probs.append(getattr(seg, "no_speech_prob", 0.0))
         text = " ".join(texts).strip()
         if not text:
+            log.info("STT: dropped (whisper VAD found no speech) dur=%.2fs", len(pcm) / self.cfg.samplerate)
             return ""
         if probs and (sum(probs) / len(probs) > self.cfg.stt_no_speech_threshold):
+            log.info("STT: dropped (no_speech_prob=%.2f) %r", sum(probs) / len(probs), text)
             return ""
         if self._is_repetitive(text):
+            log.info("STT: dropped (repetitive) %r", text)
             return ""
         return text
 
@@ -187,7 +239,7 @@ class STTEngine:
         if len(set(words)) <= 2:
             return True
         for n in (3, 4):
-            grams = [" ".join(words[i: i + n]) for i in range(len(words) - n + 1)]
+            grams = [" ".join(words[i : i + n]) for i in range(len(words) - n + 1)]
             if grams and grams.count(max(set(grams), key=grams.count)) >= 3:
                 return True
         return False

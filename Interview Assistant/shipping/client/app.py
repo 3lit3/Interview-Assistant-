@@ -39,7 +39,8 @@ from audio_capture import AudioCapture
 from config import load_config
 from context import ContextManager
 from cv_loader import build_system_prompt, load_cv
-from gate import is_question
+import time
+from gate import is_question, is_junk, is_complete
 from llm import LLMClient
 from telegram import TelegramSender
 
@@ -342,6 +343,8 @@ class GuiPipeline:
                 text = await asyncio.wait_for(self.partial_q.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
+            if is_junk(text):
+                continue
             if self.cfg.echo_transcript:
                 self.bus.partial(text)
                 if self._msg_id is None and self.telegram:
@@ -349,34 +352,65 @@ class GuiPipeline:
                 if self.telegram and self._msg_id is not None:
                     await self.telegram.update_transcript(self._msg_id, f"🎙 {text}▌")
 
+    async def _handle(self, utt: str):
+        log.info("USER: %s", utt)
+        self.bus.transcript(utt)
+        if self.cfg.question_gate and not self.cfg.echo_transcript and not is_question(utt):
+            log.info("Dropped (not a question)")
+            return
+        try:
+            if self.telegram:
+                if self.cfg.echo_transcript and self._msg_id is not None:
+                    await self.telegram.update_transcript(self._msg_id, f"🎙 {utt}")
+                    self._msg_id = None
+                else:
+                    await self.telegram.send_user_turn(utt)
+            full = ""
+            async for tok in self.llm.stream_reply(utt):
+                full += tok
+                self.bus.token(tok)
+            self.bus.suggestion_done(full)
+            if self.telegram and full.strip():
+                await self.telegram.notify(full[:4000])
+        except Exception as exc:
+            log.exception("handle failed: %s", exc)
+            self.bus.error(str(exc))
+
     async def _pipeline(self):
+        # Whisper often cuts a sentence at the interviewer's mid-question
+        # pause. Hold the fragment for merge_hold_ms so the tail of the
+        # sentence can be stitched on before anything reaches the LLM.
+        hold_s = max(0.0, self.cfg.merge_hold_ms / 1000.0)
+        pending: str | None = None
+        pending_at = 0.0
         while self._running:
             try:
                 utt = await asyncio.wait_for(self.transcript_q.get(), timeout=1.0)
             except asyncio.TimeoutError:
+                if pending is not None and time.monotonic() - pending_at >= hold_s:
+                    log.info("HOLD: releasing %r (no continuation)", pending)
+                    await self._handle(pending)
+                    pending = None
                 continue
-            log.info("USER: %s", utt)
-            self.bus.transcript(utt)
-            if self.cfg.question_gate and not self.cfg.echo_transcript and not is_question(utt):
-                log.info("Dropped (not a question)")
+            if is_junk(utt):
+                log.info("Dropped (noise/backchannel): %s", utt)
                 continue
-            try:
-                if self.telegram:
-                    if self.cfg.echo_transcript and self._msg_id is not None:
-                        await self.telegram.update_transcript(self._msg_id, f"🎙 {utt}")
-                        self._msg_id = None
-                    else:
-                        await self.telegram.send_user_turn(utt)
-                full = ""
-                async for tok in self.llm.stream_reply(utt):
-                    full += tok
-                    self.bus.token(tok)
-                self.bus.suggestion_done(full)
-                if self.telegram and full.strip():
-                    await self.telegram.notify(full[:4000])
-            except Exception as exc:
-                log.exception("handle failed: %s", exc)
-                self.bus.error(str(exc))
+            if pending is not None and time.monotonic() - pending_at >= hold_s:
+                log.info("HOLD: releasing %r (hold expired)", pending)
+                await self._handle(pending)
+                pending = None
+            if pending is not None:
+                utt = f"{pending} {utt}".strip()
+                log.info("Merged cut-off utterance -> %s", utt)
+                pending = None
+            if not is_complete(utt):
+                pending, pending_at = utt, time.monotonic()
+                log.info("HOLD: waiting for the rest of the sentence: %s", utt)
+                continue
+            await self._handle(utt)
+        if pending is not None:
+            log.info("HOLD: session ended, releasing %r", pending)
+            await self._handle(pending)
 
     async def shutdown(self):
         self._running = False
@@ -398,7 +432,13 @@ class GuiPipeline:
 
 def main():
     _bootstrap_frozen_env()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _frozen = bool(getattr(sys, "frozen", False))
+    if not _frozen:
+        # Dev runs (python.exe) keep console logs; frozen windowed exe has no
+        # console, so it logs to file only — never spawn a terminal.
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    else:
+        logging.getLogger().setLevel(logging.INFO)
     import pathlib as _pl
     _logdir = _pl.Path(os.getenv("APPDATA") or _pl.Path.home()) / "InterviewAssistant"
     try:
@@ -617,20 +657,54 @@ def main():
         else:
             bus.status("Telegram connected for next session.")
 
+    def _stop_pipeline_blocking(timeout: float = 8.0):
+        """Stop any live session and wait for its thread. Runs on window close."""
+        pipe = pipe_holder["pipe"]
+        if pipe is None:
+            return
+        try:
+            bus.status("Ending session…")
+        except Exception:
+            pass
+        try:
+            pipe.request_stop()
+        except Exception:
+            pass
+        t = pipe_holder.get("thread")
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=timeout)
+            except Exception:
+                pass
+        pipe_holder["pipe"] = None
+        pipe_holder["thread"] = None
+
+    def on_app_close():
+        _stop_pipeline_blocking()
+
     if not args.no_license:
         threading.Thread(target=license_watchdog, daemon=True).start()
 
     win = OverlayWindow(bus, on_mode_change=on_mode_change,
                         on_context_change=on_context_change,
                         on_start=start_session, on_end=stop_session,
-                        on_telegram_settings=open_telegram_settings)
+                        on_telegram_settings=open_telegram_settings,
+                        on_close=on_app_close)
     bus.status("Idle — press Start to begin recording.")
     try:
         win.run()
     finally:
-        pipe = pipe_holder["pipe"]
-        if pipe is not None:
-            pipe.request_stop()
+        # Window closed: stop everything, then hard-exit so no orphan
+        # InterviewAssistant.exe (audio loop, STT workers, watchdog) survives.
+        try:
+            _stop_pipeline_blocking()
+        except Exception:
+            pass
+        try:
+            logging.shutdown()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 if __name__ == "__main__":

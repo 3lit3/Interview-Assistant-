@@ -27,17 +27,23 @@ class Config:
     stt_device: str = "cpu"
     stt_compute_type: str = "int8"
     stt_threads: int = 4
+    stt_beam_size: int = 5
 
     vad_aggressiveness: int = 2
     vad_frame_ms: int = 30
-    silence_ms: int = 800
+    # 800ms cut interviewers off mid-sentence; 1500ms waits out a natural pause.
+    silence_ms: int = 1500
     partial_interval: float = 0.4
-    min_utterance_ms: int = 400
-    max_utterance_ms: int = 15000
+    # Short tones/beeps live under ~600ms.
+    min_utterance_ms: int = 600
+    max_utterance_ms: int = 30000
     stt_no_speech_threshold: float = 0.6
     vad_noise_multiplier: float = 2.0
     vad_min_rms: float = 250.0
     question_gate: bool = True
+    # Hold a cut-off utterance this long so the rest of the sentence can
+    # be stitched onto it before it is sent to the LLM.
+    merge_hold_ms: int = 3000
 
     llm_backend: str = "openai"
     llm_model: str = "openai/gpt-4.1-mini"
