@@ -1,0 +1,57 @@
+# ── MARK LV — what never belongs in the repository ──────────────────────────
+# Everything listed here is created by the app on first run. A fresh clone with
+# none of it present boots straight to the setup screen, which is the intended
+# first experience — so nothing here needs to be committed, and some of it must
+# never be.
+
+# ── Secrets. Committing any of these publishes them. ──────────────────────────
+# (gitignore has no trailing comments — a "# ..." after a pattern silently
+# becomes part of the pattern and matches nothing. Keep comments on their own
+# lines, starting with # in column 0.)
+config/api_keys.json
+config/certs/
+# a LINKED WhatsApp session — committing it hands somebody your WhatsApp
+# account, not just a key
+config/whatsapp_web/
+# Google OAuth tokens / client secrets (Gmail, Calendar plugins)
+**/token*.json
+**/client_secret*.json
+*credentials*.json
+.env
+.env.*
+
+# ── Personal data the assistant accumulates about you ─────────────────────────
+memory/long_term.json
+memory/*.db
+# uploaded CV/resume
+config/*.pdf
+
+# ── Python build noise ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Editors and operating systems ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Runtime output ────────────────────────────────────────────────────────────
+*.log
+logs/
+downloads/
+screenshots/
