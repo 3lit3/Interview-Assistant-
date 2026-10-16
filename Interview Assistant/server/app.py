@@ -1,13 +1,26 @@
-"""License + key-issuance + Telegram bot server.
+"""License server: NowPayments invoice → signed 30-day key → device activation.
 
-Database: PostgreSQL (Supabase) via DATABASE_URL env var.
-Telegram: One bot token (TELEGRAM_BOT_TOKEN env var), deep-link flow.
-  User clicks t.me/BOT_NAME?start=LICENSE_KEY → bot captures chat_id.
+Flow
+----
+  1. Client POST /invoice {prev_key?}      → {order_id, invoice_url}
+  2. Buyer pays in the browser. Success page: GET /success/<order_id>
+  3. NowPayments POST /ipn (HMAC-verified) → server mints a signed Ed25519 key
+     (price $14.99, 30 days; a valid prev_key extends from its expiry).
+  4. /success/<order_id> shows the key once issued; the client also polls
+     GET /order/<order_id>/status and auto-fills it.
+  5. Client POST /activate {key, device_id} binds the key to this device.
+     Max DEVICE_CAP distinct devices per key — activation needs the server
+     exactly once per device.
+  6. Everyday launches validate the key OFFLINE (signature + expiry inside the
+     key itself). Render being asleep can never lock out an activated device.
+     Optional soft revocation: client POST /recheck {kid, device_id} when
+     online; /admin/revoke flips the flag.
 
-Endpoints:
-  POST /invoice, /ipn, /activate, /verify, /issue-key  (unchanged logic, PG backend)
-  POST /register-telegram  {license_key, hwid}  → returns deep link URL
-  GET  /check-telegram     {license_key, hwid}  → returns connection status
+Database: PostgreSQL when DATABASE_URL is set (Render/Supabase), otherwise a
+local SQLite file (server/licensing.db) so the whole flow is dev-testable.
+
+MOCK_NOWPAYMENTS=1 replaces the real invoice with GET /mock-pay/<order_id>,
+which simulates a finished payment end-to-end.
 """
 from __future__ import annotations
 
@@ -16,39 +29,81 @@ import hmac
 import json
 import os
 import secrets
+import sqlite3
 import time
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from html import escape
 
-import psycopg2
-import psycopg2.extras
+import keysign
+import tgpay
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from crypto_utils import issue_encrypted_key
+
+def _load_dotenv(path: str) -> None:
+    """Minimal .env loader for local dev (Render uses dashboard env instead).
+    Existing environment variables always win. No dependency needed."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ── Config ────────────────────────────────────────────────────────
-PRICE = float(os.getenv("PRICE_USD", "9.99"))
-CURRENCY = os.getenv("PRICE_CURRENCY", "USD")
-PERIOD_DAYS = 30
+PRICE = float(os.getenv("PRICE_USD", "14.99"))
+PERIOD_DAYS = int(os.getenv("PERIOD_DAYS", "30"))
+DEVICE_CAP = int(os.getenv("DEVICE_CAP", "2"))
 NOW_API = os.getenv("NOWPAYMENTS_API_KEY", "")
 NOW_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
 MOCK = os.getenv("MOCK_NOWPAYMENTS", "1") == "1"
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-KEY_ISSUANCE_SECRET = os.getenv("KEY_ISSUANCE_SECRET", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+PUBLIC_BASE = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+SIGNING: "keysign.Ed25519PrivateKey | None" = None
 
-app = FastAPI(title="InterviewAssistant Server")
+app = FastAPI(title="Interview Assistant License Server")
 
-# ── Database ──────────────────────────────────────────────────────
+
+def _require_signing() -> "keysign.Ed25519PrivateKey":
+    if SIGNING is None:
+        raise HTTPException(500, "SIGNING_PRIVATE_KEY not configured on server")
+    return SIGNING
+
+
+# ── Database (PostgreSQL, or SQLite for local development) ────────
+
+def _is_sqlite() -> bool:
+    return (not DATABASE_URL) or DATABASE_URL.startswith("sqlite")
+
+
+def _sql(q: str) -> str:
+    # Queries here use ? placeholders; psycopg2 wants %s.
+    return q if _is_sqlite() else q.replace("?", "%s")
+
 
 @contextmanager
 def get_db():
-    url = DATABASE_URL
-    if "sslmode" not in url:
-        url += "?sslmode=require"
-    conn = psycopg2.connect(url)
+    if _is_sqlite():
+        path = DATABASE_URL.split("sqlite:///")[-1] if DATABASE_URL else \
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "licensing.db")
+        conn = sqlite3.connect(path)
+    else:
+        url = DATABASE_URL
+        if "sslmode" not in url:
+            url += ("&" if "?" in url else "?") + "sslmode=require"
+        import psycopg2
+        conn = psycopg2.connect(url)
     try:
         yield conn
         conn.commit()
@@ -56,232 +111,348 @@ def get_db():
         conn.close()
 
 
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS orders (
+    order_id TEXT PRIMARY KEY,
+    prev_key TEXT DEFAULT '',
+    created  BIGINT DEFAULT 0,
+    device_id TEXT DEFAULT '',
+    chat_id   TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS issued_keys (
+    kid      TEXT PRIMARY KEY,
+    key_str  TEXT NOT NULL,
+    order_id TEXT DEFAULT '',
+    note     TEXT DEFAULT '',
+    iat      BIGINT DEFAULT 0,
+    exp      BIGINT DEFAULT 0,
+    revoked  INTEGER DEFAULT 0,
+    chat_id  TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS activations (
+    kid          TEXT NOT NULL,
+    device_id    TEXT NOT NULL,
+    activated_at BIGINT DEFAULT 0,
+    PRIMARY KEY (kid, device_id)
+);
+CREATE TABLE IF NOT EXISTS payments (
+    payment_id TEXT PRIMARY KEY,
+    order_id   TEXT DEFAULT '',
+    status     TEXT DEFAULT '',
+    raw        TEXT DEFAULT '',
+    ts         BIGINT DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_issued_order ON issued_keys(order_id);
+"""
+
+
+def _column_exists(cur, table: str, name: str) -> bool:
+    if _is_sqlite():
+        cur.execute(f"PRAGMA table_info({table})")
+        return any(r[1] == name for r in cur.fetchall())
+    cur.execute("SELECT 1 FROM information_schema.columns "
+                "WHERE table_name=%s AND column_name=%s", (table, name))
+    return cur.fetchone() is not None
+
+
+def _ensure_columns(cur, table: str, cols: list) -> None:
+    """Tolerant migration: add columns that an older database is missing.
+    Never raises — a database that cannot be altered still has to serve."""
+    for name, decl in cols:
+        if _column_exists(cur, table, name):
+            continue
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            print(f"[db] migrated {table}.{name}", flush=True)
+        except Exception as exc:
+            print(f"[db] could not add {table}.{name}: {exc}", flush=True)
+
+
 def init_db():
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS licenses (
-                key TEXT PRIMARY KEY,
-                hwid TEXT DEFAULT '',
-                status TEXT DEFAULT 'pending',
-                current_period_end BIGINT DEFAULT 0,
-                created BIGINT DEFAULT 0,
-                email TEXT DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS payments (
-                payment_id TEXT PRIMARY KEY,
-                key TEXT,
-                status TEXT,
-                raw TEXT,
-                ts BIGINT
-            );
-            CREATE TABLE IF NOT EXISTS telegram_connections (
-                chat_id TEXT PRIMARY KEY,
-                bot_token TEXT NOT NULL,
-                user_hwid TEXT DEFAULT '',
-                license_key TEXT DEFAULT '',
-                connected_at BIGINT DEFAULT 0,
-                is_active BOOLEAN DEFAULT TRUE
-            );
-        """)
+        for stmt in _SCHEMA.split(";"):
+            if stmt.strip():
+                cur.execute(stmt)
+        _ensure_columns(cur, "orders",
+                        [("device_id", "TEXT DEFAULT ''"), ("chat_id", "TEXT DEFAULT ''")])
+        _ensure_columns(cur, "issued_keys", [("chat_id", "TEXT DEFAULT ''")])
         cur.close()
 
 
 @app.on_event("startup")
-async def _startup():
+def _startup():
+    global SIGNING
+    try:
+        SIGNING = keysign.load_private_key()
+        signing_state = "yes"
+    except Exception as exc:
+        SIGNING = None
+        signing_state = f"NO ({exc})"
+    print(f"[server] mode={'MOCK' if MOCK else 'LIVE'} db={'sqlite' if _is_sqlite() else 'pg'} "
+          f"signing={signing_state} price={PRICE} days={PERIOD_DAYS} cap={DEVICE_CAP}", flush=True)
     init_db()
-    print(f"[server] mode={'MOCK' if MOCK else 'LIVE'} pg={'yes' if DATABASE_URL else 'NO'} "
-          f"tg_bot={'yes' if TG_BOT_TOKEN else 'NO'} llm_key={'yes' if LLM_API_KEY else 'NO'}",
-          flush=True)
+    if TG_TOKEN:
+        started = tgpay.start(TG_TOKEN, hooks={
+            "lookup_order": _hook_lookup_order,
+            "key_for_order": _hook_key_for_order,
+            "invoice_url": _hook_invoice_url,
+            "link_chat": _hook_link_chat,
+            "keys_by_chat": _hook_keys_by_chat,
+            "public_base": PUBLIC_BASE,
+        })
+        if not started:
+            print("[server] telegram bot FAILED to start (check TELEGRAM_BOT_TOKEN)",
+                  flush=True)
+    else:
+        print("[server] telegram bot: TELEGRAM_BOT_TOKEN not set — "
+              "no chat delivery of keys", flush=True)
 
 
 @app.get("/status")
-async def status():
+def status():
     return {"mode": "mock" if MOCK else "live",
-            "database": "connected" if DATABASE_URL else "missing",
-            "telegram_bot": "configured" if TG_BOT_TOKEN else "missing",
-            "llm_key": "configured" if LLM_API_KEY else "missing",
-            "key_secret": "configured" if KEY_ISSUANCE_SECRET else "missing",
-            "price": PRICE, "currency": CURRENCY, "days": PERIOD_DAYS}
+            "database": "sqlite" if _is_sqlite() else "connected",
+            "signing_key": "configured" if SIGNING else "missing",
+            "telegram_bot": "on" if tgpay.running() else "off",
+            "price": PRICE, "days": PERIOD_DAYS, "device_cap": DEVICE_CAP}
 
 
-# ── Helpers ───────────────────────────────────────────────────────
+# ── Key minting ───────────────────────────────────────────────────
 
-def new_key() -> str:
-    return "IA-" + secrets.token_urlsafe(18).replace("-", "").replace("_", "")[:24].upper()
+def _bind_device(cur, kid: str, device_id: str, now: int) -> None:
+    """Purchase = activation: the buying device is bound at mint time
+    (idempotent, and never over the DEVICE_CAP)."""
+    if not device_id:
+        return
+    cur.execute(_sql("SELECT COUNT(*) FROM activations WHERE kid=?"), (kid,))
+    if int(cur.fetchone()[0]) >= DEVICE_CAP:
+        return
+    cur.execute(_sql(
+        "INSERT INTO activations(kid, device_id, activated_at) VALUES(?,?,?) "
+        "ON CONFLICT (kid, device_id) DO NOTHING"), (kid, device_id, now))
 
 
-def nowpayments_invoice(order_id: str) -> str:
-    if not NOW_API or MOCK:
-        return f"http://127.0.0.1:8000/pay/MOCK-{order_id} (set NOWPAYMENTS_API_KEY for real link)"
+def _mint(order_id: str, prev_key: str, note: str = "") -> dict:
+    """Sign a fresh key. Renewal: a valid prev_key extends from its expiry.
+    Idempotent per order_id — repeated IPNs return the already-issued key.
+    The order's device_id is bound immediately and the order's chat_id is
+    stamped on the key, then the key is pushed to that chat."""
+    priv = _require_signing()
+    now = int(time.time())
+    base = now
+    if prev_key:
+        try:
+            payload = keysign.parse_and_verify(keysign.public_key_hex(priv), prev_key)
+            base = max(now, int(payload["exp"]))
+        except Exception:
+            base = now  # unverifiable prev key: treat as a fresh purchase
+    kid = keysign.new_kid()
+    exp = base + PERIOD_DAYS * 86400
+    key_str = keysign.sign_key(priv, now, exp, kid)
+    device_id = chat_id = ""
+    existing = None
+    with get_db() as conn:
+        cur = conn.cursor()
+        if order_id:
+            cur.execute(_sql("SELECT device_id, chat_id FROM orders WHERE order_id=?"),
+                        (order_id,))
+            orow = cur.fetchone()
+            if orow:
+                device_id = (orow[0] or "").strip()
+                chat_id = (orow[1] or "").strip()
+            cur.execute(_sql("SELECT key_str, exp, kid FROM issued_keys WHERE order_id=?"),
+                        (order_id,))
+            row = cur.fetchone()
+            if row:
+                _bind_device(cur, row[2], device_id, now)
+                cur.close()
+                existing = {"key": row[0], "exp": int(row[1]), "kid": row[2]}
+        if existing is None:
+            cur.execute(_sql(
+                "INSERT INTO issued_keys(kid,key_str,order_id,note,iat,exp,revoked,chat_id) "
+                "VALUES(?,?,?,?,?,?,0,?)"),
+                (kid, key_str, order_id, note, now, exp, chat_id))
+            _bind_device(cur, kid, device_id, now)
+            cur.close()
+    if existing is not None:
+        issued = existing
+    else:
+        print(f"[mint] kid={kid} order={order_id or '-'} exp={exp} "
+              f"device={device_id or '-'} chat={chat_id or '-'}", flush=True)
+        issued = {"key": key_str, "exp": exp, "kid": kid}
+    if order_id:
+        _notify_chat(order_id, issued)
+    return issued
+
+
+# ── Telegram delivery (hooks + notify) ────────────────────────────
+
+def _hook_lookup_order(order_id: str):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("SELECT prev_key FROM orders WHERE order_id=?"), (order_id,))
+        row = cur.fetchone()
+        cur.close()
+    return {"prev_key": row[0] or ""} if row else None
+
+
+def _hook_key_for_order(order_id: str):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("SELECT key_str, exp FROM issued_keys WHERE order_id=?"),
+                    (order_id,))
+        row = cur.fetchone()
+        cur.close()
+    return (row[0], int(row[1])) if row else None
+
+
+def _hook_invoice_url(order_id: str, prev_key: str) -> str:
+    try:
+        return (f"{PUBLIC_BASE}/mock-pay/{order_id}" if MOCK
+                else _nowpayments_invoice(order_id))
+    except Exception as exc:
+        print(f"[tg] invoice for {order_id} failed: {exc}", flush=True)
+        return ""
+
+
+def _hook_link_chat(order_id: str, chat_id) -> None:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("UPDATE orders SET chat_id=? WHERE order_id=?"),
+                    (str(chat_id), str(order_id)))
+        cur.close()
+
+
+def _hook_keys_by_chat(chat_id) -> list:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql(
+            "SELECT kid, key_str, exp, revoked FROM issued_keys WHERE chat_id=? "
+            "ORDER BY exp DESC"), (str(chat_id),))
+        rows = cur.fetchall()
+        cur.close()
+    return [{"kid": r[0], "key_str": r[1], "exp": int(r[2]),
+             "revoked": bool(int(r[3]))} for r in rows]
+
+
+def _notify_chat(order_id: str, issued: dict) -> None:
+    """Push the freshly minted key to the chat that paid for the order.
+    Quiet no-op when no chat is linked or the bot is not running."""
+    if not order_id:
+        return
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("SELECT chat_id FROM orders WHERE order_id=?"), (order_id,))
+        row = cur.fetchone()
+        cur.close()
+    chat_id = row[0] if row else ""
+    if not chat_id:
+        return
+    when = time.strftime("%Y-%m-%d", time.gmtime(int(issued["exp"])))
+    text = (f"Payment received — Interview Assistant\n\n"
+            f"Your license key (valid until {when}):\n\n"
+            f"{issued['key']}\n\n"
+            f"Redeem: myapp://license?key={issued['key']}\n\n"
+            f"Payment page: {PUBLIC_BASE}/success/{order_id}\n"
+            f"The key works on up to {DEVICE_CAP} devices.")
+    tgpay.send_message(chat_id, text,
+                       button=("Open key page", f"{PUBLIC_BASE}/success/{order_id}"))
+
+
+
+# ── Purchase flow ─────────────────────────────────────────────────
+
+def _nowpayments_invoice(order_id: str) -> str:
     payload = {
-        "price_amount": PRICE, "price_currency": CURRENCY,
-        "order_id": order_id, "order_description": "Interview Assistant $9.99/mo, 1 seat",
+        "price_amount": PRICE, "price_currency": "USD",
+        "order_id": order_id,
+        "order_description": f"Interview Assistant — {PERIOD_DAYS} days",
+        "success_url": f"{PUBLIC_BASE}/success/{order_id}",
+        "cancel_url": f"{PUBLIC_BASE}/success/{order_id}",
     }
-    for field, env in (("ipn_callback_url", "IPN_CALLBACK_URL"),
-                       ("success_url", "SUCCESS_URL"),
-                       ("cancel_url", "CANCEL_URL")):
-        val = os.getenv(env, "").strip()
-        if val:
-            payload[field] = val
+    ipn = os.getenv("IPN_CALLBACK_URL", "").strip()
+    if ipn:
+        payload["ipn_callback_url"] = ipn
     req = urllib.request.Request(
         "https://api.nowpayments.io/v1/invoice",
         data=json.dumps(payload).encode(),
-        headers={"x-api-key": NOW_API, "Content-Type": "application/json"}, method="POST")
+        headers={"x-api-key": NOW_API, "Content-Type": "application/json"},
+        method="POST")
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             body = json.loads(r.read().decode())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode()[:500]
-        raise HTTPException(status_code=502,
-                            detail=f"NOWPayments rejected invoice (HTTP {exc.code}): {detail}")
+        raise HTTPException(502, f"NOWPayments rejected invoice (HTTP {exc.code}): {detail}")
     try:
         return body["invoice_url"]
     except KeyError:
-        raise HTTPException(status_code=502,
-                            detail=f"NOWPayments gave no invoice_url: {json.dumps(body)[:500]}")
+        raise HTTPException(502, f"NOWPayments gave no invoice_url: {json.dumps(body)[:500]}")
 
-
-def _extend(key: str) -> int:
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT current_period_end FROM licenses WHERE key=%s", (key,))
-        row = cur.fetchone()
-        if not row:
-            cur.execute("INSERT INTO licenses(key,hwid,status,current_period_end,created) VALUES(%s,'', 'active',0,%s)",
-                        (key, int(time.time())))
-            base = 0
-        else:
-            base = int(row[0])
-        base = max(int(time.time()), base)
-        new_end = base + PERIOD_DAYS * 86400
-        cur.execute("UPDATE licenses SET status='active', current_period_end=%s WHERE key=%s", (new_end, key))
-        cur.close()
-    return new_end
-
-
-def _check(key: str, hwid: str) -> tuple[bool, str, int]:
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT hwid, status, current_period_end FROM licenses WHERE key=%s", (key,))
-        row = cur.fetchone()
-        cur.close()
-    if not row:
-        return False, "unknown license key", 0
-    bound, status, end = row
-    if bound and bound != hwid:
-        return False, "key already bound to another device (1 seat)", 0
-    if status != "active" or int(end) < time.time():
-        return False, "subscription inactive or expired — pay $9.99 to renew", 0
-    return True, "ok", int(end)
-
-
-# ── License endpoints ─────────────────────────────────────────────
 
 @app.post("/invoice")
-async def invoice(body: dict):
-    hwid = (body.get("hwid") or "")[:64]
-    key = (body.get("key") or "").strip() or new_key()
+def invoice(body: dict):
+    prev_key = (body.get("prev_key") or "").strip()
+    if prev_key:
+        try:
+            keysign.parse_and_verify(keysign.public_key_hex(_require_signing()), prev_key)
+        except ValueError as exc:
+            raise HTTPException(400, f"previous key is not valid: {exc}")
+    # The buying device travels with the order: purchase = activation.
+    device_id = str(body.get("device_id") or "").strip()[:64]
+    order_id = "ORD-" + secrets.token_urlsafe(12)
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT key FROM licenses WHERE key=%s", (key,))
-        if not cur.fetchone():
-            cur.execute("INSERT INTO licenses(key,hwid,status,current_period_end,created) VALUES(%s,%s, 'pending',0,%s)",
-                        (key, hwid, int(time.time())))
+        cur.execute(_sql(
+            "INSERT INTO orders(order_id, prev_key, created, device_id) "
+            "VALUES(?,?,?,?)"), (order_id, prev_key, int(time.time()), device_id))
         cur.close()
-    return {"key": key, "invoice_url": nowpayments_invoice(key),
-            "price": PRICE, "currency": CURRENCY, "days": PERIOD_DAYS}
+    url = (f"{PUBLIC_BASE}/mock-pay/{order_id}" if MOCK
+           else _nowpayments_invoice(order_id))
+    resp = {"order_id": order_id, "invoice_url": url,
+            "price": PRICE, "days": PERIOD_DAYS, "device_cap": DEVICE_CAP}
+    # Deep link so the buyer can finish inside Telegram (bot replies with the
+    # invoice and later delivers the key to that chat).
+    link = tgpay.deep_link(order_id)
+    if link:
+        resp["bot_start"] = link
+        resp["bot_username"] = tgpay.bot_username()
+    return resp
 
 
-@app.post("/admin/extend")
-async def admin_extend(body: dict):
-    token = os.getenv("ADMIN_TOKEN", "")
-    if not token or not secrets.compare_digest(str(body.get("admin_token", "")), token):
-        raise HTTPException(401, "bad admin token")
-    key = (body.get("key") or "").strip()
-    if not key:
-        raise HTTPException(400, "key required")
-    days = int(body.get("days", PERIOD_DAYS))
+@app.get("/order/{order_id}/status")
+def order_status(order_id: str):
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT current_period_end FROM licenses WHERE key=%s", (key,))
+        cur.execute(_sql("SELECT key_str, exp, kid FROM issued_keys WHERE order_id=?"),
+                    (order_id,))
         row = cur.fetchone()
-        created = row is None
-        if not row:
-            cur.execute("INSERT INTO licenses(key,hwid,status,current_period_end,created) VALUES(%s,'', 'active',0,%s)",
-                        (key, int(time.time())))
-            base = 0
-        else:
-            base = int(row[0])
-        new_end = max(int(time.time()), base) + days * 86400
-        cur.execute("UPDATE licenses SET status='active', current_period_end=%s WHERE key=%s", (new_end, key))
-        cur.close()
-    return {"ok": True, "exp": new_end, "created": created}
-
-
-@app.post("/admin/lookup")
-async def admin_lookup(body: dict):
-    token = os.getenv("ADMIN_TOKEN", "")
-    if not token or not secrets.compare_digest(str(body.get("admin_token", "")), token):
-        raise HTTPException(401, "bad admin token")
-    key = (body.get("key") or "").strip()
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT status, current_period_end, hwid FROM licenses WHERE key=%s", (key,))
-        row = cur.fetchone()
-        cur.execute("SELECT COUNT(*) FROM licenses")
-        n = cur.fetchone()[0]
-        cur.close()
-    if not row:
-        return {"exists": False, "total_keys": n}
-    status, end, hwid = row
-    return {"exists": True, "status": status, "exp": int(end),
-            "active_now": status == "active" and int(end) > int(time.time()),
-            "bound": bool(hwid), "total_keys": n}
-
-
-@app.post("/activate")
-async def activate(body: dict):
-    key, hwid = (body.get("key") or "").strip(), (body.get("hwid") or "")[:64]
-    if not key or not hwid:
-        raise HTTPException(400, "key + hwid required")
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT hwid FROM licenses WHERE key=%s", (key,))
-        row = cur.fetchone()
-        if not row:
+        if row:
             cur.close()
-            raise HTTPException(404, "unknown key")
-        if not row[0]:
-            cur.execute("UPDATE licenses SET hwid=%s WHERE key=%s", (hwid, key))
+            return {"status": "issued", "key": row[0], "exp": int(row[1]), "kid": row[2]}
+        cur.execute(_sql("SELECT created FROM orders WHERE order_id=?"), (order_id,))
+        known = cur.fetchone() is not None
         cur.close()
-    ok, msg, end = _check(key, hwid)
-    return {"ok": ok, "error": None if ok else msg, "exp": end}
+    return {"status": "pending" if known else "unknown"}
 
 
-@app.post("/verify")
-async def verify(body: dict):
-    return await activate(body)
-
-
-@app.post("/issue-key")
-async def issue_key(body: dict):
-    key = (body.get("key") or "").strip()
-    hwid = (body.get("hwid") or "").strip()
-    if not key or not hwid:
-        raise HTTPException(400, "key + hwid required")
-    if not LLM_API_KEY:
-        raise HTTPException(500, "LLM_API_KEY not configured on server")
-    if not KEY_ISSUANCE_SECRET:
-        raise HTTPException(500, "KEY_ISSUANCE_SECRET not configured on server")
-    ok, msg, _ = _check(key, hwid)
-    if not ok:
-        raise HTTPException(403, f"license invalid: {msg}")
-    try:
-        result = issue_encrypted_key(hwid, LLM_API_KEY)
-    except Exception as exc:
-        raise HTTPException(500, f"key issuance failed: {exc}")
-    return {"ok": True, **result}
+def _handle_payment(order_id: str, payment_id: str, status: str, raw: str = "") -> None:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql(
+            "INSERT INTO payments(payment_id,order_id,status,raw,ts) VALUES(?,?,?,?,?) "
+            "ON CONFLICT (payment_id) DO NOTHING"),
+            (payment_id or f"{order_id}-{int(time.time())}", order_id, status,
+             raw[:4000], int(time.time())))
+        cur.close()
+    if status in ("finished", "confirmed") and order_id:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(_sql("SELECT prev_key FROM orders WHERE order_id=?"), (order_id,))
+            row = cur.fetchone()
+            cur.close()
+        _mint(order_id, row[0] if row else "")
 
 
 @app.post("/ipn")
@@ -300,160 +471,195 @@ async def ipn(req: Request, x_nowpayments_sig: str = Header(default="", alias="x
         except Exception:
             raise HTTPException(401, "bad IPN signature")
     data = json.loads(raw or b"{}")
-    order_id = str(data.get("order_id", ""))
-    status = str(data.get("payment_status", ""))
-    pid = str(data.get("payment_id", ""))
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO payments(payment_id,key,status,raw,ts) VALUES(%s,%s,%s,%s,%s) ON CONFLICT (payment_id) DO NOTHING",
-                    (pid or order_id + str(time.time()), order_id, status, raw.decode()[:4000], int(time.time())))
-        cur.close()
-    if status in ("finished", "confirmed") and order_id:
-        _extend(order_id)
+    _handle_payment(str(data.get("order_id", "")),
+                    str(data.get("payment_id", "")),
+                    str(data.get("payment_status", "")),
+                    raw.decode(errors="replace"))
     return JSONResponse({"ok": True})
 
 
-@app.post("/simulate_pay")
-async def simulate_pay(body: dict):
+@app.get("/mock-pay/{order_id}")
+def mock_pay(order_id: str):
     if not MOCK:
-        raise HTTPException(403, "disabled when MOCK_NOWPAYMENTS=0")
-    return {"ok": True, "exp": _extend((body.get("key") or "").strip())}
+        raise HTTPException(404, "not found")
+    _handle_payment(order_id, f"MOCK-{order_id}", "finished", "mock")
+    return RedirectResponse(f"/success/{order_id}", status_code=302)
 
 
-# ── Telegram deep-link ───────────────────────────────────────────
+# ── Success page ──────────────────────────────────────────────────
 
-@app.post("/register-telegram")
-async def register_telegram(body: dict):
-    """Client calls this to get a deep-link URL for Telegram connection."""
-    license_key = (body.get("license_key") or "").strip()
-    hwid = (body.get("hwid") or "").strip()
-    if not license_key or not hwid:
-        raise HTTPException(400, "license_key + hwid required")
-    if not TG_BOT_TOKEN:
-        raise HTTPException(500, "TELEGRAM_BOT_TOKEN not configured on server")
-
-    ok, msg, _ = _check(license_key, hwid)
-    if not ok:
-        raise HTTPException(403, f"license invalid: {msg}")
-
-    # Get bot username from Telegram API
-    bot_username = _get_bot_username()
-    if not bot_username:
-        raise HTTPException(500, "Could not fetch bot username from Telegram")
-
-    deep_link = f"https://t.me/{bot_username}?start={license_key}"
-    return {"ok": True, "deep_link": deep_link, "bot_username": bot_username,
-            "bot_token": TG_BOT_TOKEN}
+_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="{refresh}">
+<title>Interview Assistant — your license key</title>
+<style>
+ body {{ background:#0b0f14; color:#c9d5e0; font:15px/1.5 system-ui,sans-serif;
+        max-width:640px; margin:48px auto; padding:0 20px; }}
+ h1 {{ color:#4fd1ff; font-weight:600; }}
+ .key {{ background:#121a24; border:1px solid #2a3a4d; border-radius:8px;
+        padding:14px 16px; font:14px/1.4 Consolas,monospace; color:#9ef01a;
+        word-break:break-all; user-select:all; }}
+ .muted {{ color:#7a8a9a; font-size:13px; }}
+ a {{ color:#4fd1ff; }}
+</style></head><body>
+<h1>Interview Assistant</h1>
+{body}
+<p class="muted">Order <code>{order}</code> · ${price} / {days} days</p>
+</body></html>"""
 
 
-@app.get("/check-telegram")
-async def check_telegram(license_key: str, hwid: str):
-    """Client polls this to check if Telegram connection is established."""
-    if not license_key or not hwid:
-        raise HTTPException(400, "license_key + hwid required")
-
+def _success_page(order_id: str) -> HTMLResponse:
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT chat_id, connected_at FROM telegram_connections "
-            "WHERE license_key=%s AND user_hwid=%s AND is_active=TRUE",
-            (license_key, hwid))
+        cur.execute(_sql("SELECT key_str, exp FROM issued_keys WHERE order_id=?"), (order_id,))
         row = cur.fetchone()
         cur.close()
-
     if row:
-        return {"connected": True, "chat_id": row[0], "connected_at": row[1]}
-    return {"connected": False}
+        key, exp = row[0], int(row[1])
+        body = (f"<p>Payment received. Your license key (valid until "
+                f"{time.strftime('%Y-%m-%d', time.gmtime(exp))}):</p>"
+                f'<div class="key">{escape(key)}</div>'
+                "<p>Copy it and paste it into the app's license window. "
+                "The key works on up to {cap} devices.</p>").format(cap=DEVICE_CAP)
+        refresh = ""
+    else:
+        body = ("<p>Payment not confirmed yet — this page refreshes every 5 seconds. "
+                "Paid but stuck? Give it a couple of minutes; if it never appears, "
+                "contact support with your order id.</p>"
+                '<p class="muted">You can close this tab and come back later — '
+                "the app is also watching this order and will fill the key in for you.</p>")
+        refresh = '5'
+    return HTMLResponse(_PAGE.format(refresh=refresh, body=body,
+                                     order=escape(order_id), price=PRICE, days=PERIOD_DAYS))
 
 
-def _get_bot_username() -> str:
-    """Fetch bot username from Telegram Bot API."""
+@app.get("/success/{order_id}")
+def success(order_id: str):
+    return _success_page(order_id)
+
+
+# ── Activation + soft recheck ─────────────────────────────────────
+
+@app.post("/activate")
+def activate(body: dict):
+    priv = _require_signing()
+    key = (body.get("key") or "").strip()
+    device_id = (body.get("device_id") or "").strip()[:64]
+    if not key or not device_id:
+        raise HTTPException(400, "key + device_id required")
     try:
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getMe",
-            method="GET")
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read().decode())
-        return data.get("result", {}).get("username", "")
-    except Exception:
-        return ""
-
-
-# ── Telegram bot (long-polling) ──────────────────────────────────
-
-_tg_offset = 0
-_tg_last_poll = 0
-
-
-def _poll_telegram():
-    """Poll Telegram for /start messages. Called from background task."""
-    global _tg_offset, _tg_last_poll
-    if not TG_BOT_TOKEN:
-        return
-
-    try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates?offset={_tg_offset}&timeout=5&allowed_updates=[\"message\"]"
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode())
-    except Exception:
-        return
-
-    for update in data.get("result", []):
-        _tg_offset = update["update_id"] + 1
-        msg = update.get("message", {})
-        text = msg.get("text", "")
-        chat_id = str(msg.get("chat", {}).get("id", ""))
-
-        if text.startswith("/start ") and chat_id:
-            license_key = text[len("/start "):].strip()
-            _store_telegram_connection(license_key, chat_id)
-
-
-def _store_telegram_connection(license_key: str, chat_id: str):
-    """Store Telegram chat_id linked to a license key."""
-    if not license_key or not chat_id:
-        return
-    try:
-        with get_db() as conn:
-            cur = conn.cursor()
-            # Find hwid for this license key
-            cur.execute("SELECT hwid FROM licenses WHERE key=%s", (license_key,))
-            row = cur.fetchone()
-            hwid = row[0] if row else ""
-
-            cur.execute("""
-                INSERT INTO telegram_connections(chat_id, bot_token, user_hwid, license_key, connected_at, is_active)
-                VALUES(%s, %s, %s, %s, %s, TRUE)
-                ON CONFLICT (chat_id) DO UPDATE SET
-                    bot_token=EXCLUDED.bot_token,
-                    user_hwid=EXCLUDED.user_hwid,
-                    license_key=EXCLUDED.license_key,
-                    connected_at=EXCLUDED.connected_at,
-                    is_active=TRUE
-            """, (chat_id, TG_BOT_TOKEN, hwid, license_key, int(time.time())))
+        payload = keysign.parse_and_verify(keysign.public_key_hex(priv), key)
+    except ValueError as exc:
+        raise HTTPException(403, f"license invalid: {exc}")
+    kid, exp = str(payload["kid"]), int(payload["exp"])
+    if exp < time.time():
+        raise HTTPException(403, "license expired")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("SELECT revoked FROM issued_keys WHERE kid=?"), (kid,))
+        row = cur.fetchone()
+        if row and int(row[0]):
             cur.close()
-    except Exception as exc:
-        print(f"[telegram] store failed: {exc}", flush=True)
+            raise HTTPException(403, "license revoked")
+        cur.execute(_sql("SELECT device_id FROM activations WHERE kid=? AND device_id=?"),
+                    (kid, device_id))
+        already = cur.fetchone() is not None
+        if not already:
+            cur.execute(_sql("SELECT COUNT(*) FROM activations WHERE kid=?"), (kid,))
+            count = int(cur.fetchone()[0])
+            if count >= DEVICE_CAP:
+                cur.close()
+                raise HTTPException(
+                    403, f"device cap reached — this key is already active on "
+                         f"{count} devices (limit {DEVICE_CAP})")
+            cur.execute(_sql(
+                "INSERT INTO activations(kid, device_id, activated_at) VALUES(?,?,?)"),
+                (kid, device_id, int(time.time())))
+        cur.execute(_sql("SELECT COUNT(*) FROM activations WHERE kid=?"), (kid,))
+        count = int(cur.fetchone()[0])
+        cur.close()
+    return {"ok": True, "exp": exp, "kid": kid, "devices": count,
+            "remaining": max(0, DEVICE_CAP - count)}
 
 
-import threading
+@app.post("/recheck")
+def recheck(body: dict):
+    """Soft revocation check. ok=False means revoked; the key's own signature
+    and expiry remain authoritative for everything else."""
+    kid = (body.get("kid") or "").strip()
+    device_id = (body.get("device_id") or "").strip()
+    if not kid:
+        raise HTTPException(400, "kid required")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("SELECT revoked, exp FROM issued_keys WHERE kid=?"), (kid,))
+        row = cur.fetchone()
+        activated = False
+        if device_id:
+            cur.execute(_sql("SELECT 1 FROM activations WHERE kid=? AND device_id=?"),
+                        (kid, device_id))
+            activated = cur.fetchone() is not None
+        cur.close()
+    revoked = bool(row and int(row[0]))
+    return {"ok": not revoked, "revoked": revoked,
+            "exp": int(row[1]) if row else 0, "activated": activated}
 
 
-def _telegram_poll_loop():
-    """Background thread: poll Telegram for /start messages."""
-    global _tg_last_poll
-    while True:
-        try:
-            _poll_telegram()
-        except Exception:
-            pass
-        time.sleep(3)
+# ── Admin ─────────────────────────────────────────────────────────
+
+def _admin_check(token: str):
+    if not ADMIN_TOKEN or not secrets.compare_digest(str(token or ""), ADMIN_TOKEN):
+        raise HTTPException(401, "bad admin token")
 
 
-@app.on_event("startup")
-async def _start_telegram_poll():
-    if TG_BOT_TOKEN:
-        t = threading.Thread(target=_telegram_poll_loop, daemon=True)
-        t.start()
-        print("[server] Telegram bot polling started", flush=True)
+@app.post("/admin/mint")
+def admin_mint(body: dict):
+    """Mint a standalone key by hand — comps, or recovering a buyer whose
+    payment landed while the server was asleep."""
+    _admin_check(body.get("admin_token", ""))
+    days = int(body.get("days", PERIOD_DAYS))
+    now = int(time.time())
+    priv = _require_signing()
+    kid = keysign.new_kid()
+    exp = now + days * 86400
+    key_str = keysign.sign_key(priv, now, exp, kid)
+    note = str(body.get("note", ""))[:200]
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql(
+            "INSERT INTO issued_keys(kid,key_str,order_id,note,iat,exp,revoked) "
+            "VALUES(?,?,?,?,?,?,0)"),
+            (kid, key_str, "", note, now, exp))
+        cur.close()
+    return {"ok": True, "key": key_str, "kid": kid, "exp": exp}
+
+
+@app.post("/admin/revoke")
+def admin_revoke(body: dict):
+    _admin_check(body.get("admin_token", ""))
+    kid = (body.get("kid") or "").strip()
+    if not kid:
+        raise HTTPException(400, "kid required")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("UPDATE issued_keys SET revoked=1 WHERE kid=?"), (kid,))
+        cur.close()
+    return {"ok": True}
+
+
+@app.post("/admin/lookup")
+def admin_lookup(body: dict):
+    _admin_check(body.get("admin_token", ""))
+    order_id = (body.get("order_id") or "").strip()
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("SELECT key_str, exp, kid, revoked FROM issued_keys WHERE order_id=?"),
+                    (order_id,))
+        row = cur.fetchone()
+        cur.execute(_sql("SELECT COUNT(*) FROM issued_keys"))
+        total = int(cur.fetchone()[0])
+        cur.close()
+    if not row:
+        return {"exists": False, "total_keys": total}
+    return {"exists": True, "total_keys": total, "key": row[0], "exp": int(row[1]),
+            "kid": row[2], "revoked": bool(int(row[3]))}
