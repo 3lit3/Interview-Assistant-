@@ -177,6 +177,8 @@ def init_db():
         _ensure_columns(cur, "orders",
                         [("device_id", "TEXT DEFAULT ''"), ("chat_id", "TEXT DEFAULT ''")])
         _ensure_columns(cur, "issued_keys", [("chat_id", "TEXT DEFAULT ''")])
+        # v1 Postgres already had a payments table without order_id
+        _ensure_columns(cur, "payments", [("order_id", "TEXT DEFAULT ''")])
         cur.close()
 
 
