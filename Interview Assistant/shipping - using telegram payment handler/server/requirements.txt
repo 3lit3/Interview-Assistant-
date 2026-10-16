@@ -1,0 +1,4 @@
+fastapi>=0.100
+uvicorn>=0.22
+cryptography>=42.0
+psycopg2-binary>=2.9

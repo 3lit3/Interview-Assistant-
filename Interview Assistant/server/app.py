@@ -143,6 +143,11 @@ CREATE TABLE IF NOT EXISTS payments (
     ts         BIGINT DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_issued_order ON issued_keys(order_id);
+CREATE TABLE IF NOT EXISTS link_challenges (
+    nonce   TEXT PRIMARY KEY,
+    chat_id TEXT DEFAULT '',
+    ts      BIGINT DEFAULT 0
+);
 """
 
 
@@ -201,6 +206,7 @@ def _startup():
             "invoice_url": _hook_invoice_url,
             "link_chat": _hook_link_chat,
             "keys_by_chat": _hook_keys_by_chat,
+            "link_nonce": _hook_link_nonce,
             "public_base": PUBLIC_BASE,
         })
         if not started:
@@ -319,11 +325,36 @@ def _hook_invoice_url(order_id: str, prev_key: str) -> str:
 
 
 def _hook_link_chat(order_id: str, chat_id) -> None:
+    """Stamp the paying chat on the order AND on any key already issued for
+    it — a /start after mint must relink a key that shipped chat-less."""
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(_sql("UPDATE orders SET chat_id=? WHERE order_id=?"),
                     (str(chat_id), str(order_id)))
+        cur.execute(_sql("UPDATE issued_keys SET chat_id=? WHERE order_id=?"),
+                    (str(chat_id), str(order_id)))
         cur.close()
+
+
+def _hook_link_nonce(nonce: str, chat_id) -> bool:
+    """Bot received /start link_<nonce> — remember the chat for the app's
+    poll on POST /link/status. Nonces live 10 minutes, single use."""
+    now = int(time.time())
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(_sql("DELETE FROM link_challenges WHERE ts<?"),
+                        (now - 600,))
+            cur.execute(_sql(
+                "INSERT INTO link_challenges(nonce, chat_id, ts) VALUES(?,?,?) "
+                "ON CONFLICT (nonce) DO UPDATE SET "
+                "chat_id=excluded.chat_id, ts=excluded.ts"),
+                (str(nonce), str(chat_id), now))
+            cur.close()
+        return True
+    except Exception as exc:
+        print(f"[link] could not record nonce: {exc}", flush=True)
+        return False
 
 
 def _hook_keys_by_chat(chat_id) -> list:
@@ -605,6 +636,150 @@ def recheck(body: dict):
     revoked = bool(row and int(row[0]))
     return {"ok": not revoked, "revoked": revoked,
             "exp": int(row[1]) if row else 0, "activated": activated}
+
+
+# ── Zero-config Telegram: whoami / relay send / payment-chat link ─
+#
+# The app ships with NO bot token (Mode B). After the purchase the buyer
+# taps one deep link, this server's shared bot records their chat against
+# the license, and every later app message is relayed here by key — the
+# shared token never reaches the client.
+
+_TG_HITS: dict = {}          # kid -> [t] sliding window of relay ops
+_TG_RATE_LIMIT = 30          # ops …
+_TG_RATE_WINDOW = 5.0        # … per this many seconds, per key
+
+
+def _tg_rate(kid: str) -> None:
+    now = time.time()
+    hits = [t for t in _TG_HITS.get(kid, []) if now - t < _TG_RATE_WINDOW]
+    if len(hits) >= _TG_RATE_LIMIT:
+        raise HTTPException(429, "too many Telegram operations — slow down")
+    hits.append(now)
+    if len(_TG_HITS) > 200:
+        for k in [k for k, v in _TG_HITS.items() if not v or now - v[-1] > 30.0]:
+            _TG_HITS.pop(k, None)
+    _TG_HITS[kid] = hits
+
+
+def _verify_key(key: str) -> dict:
+    """Signature + expiry + revocation of a full key → its payload.
+    403 on anything not a live license; 500 when signing is unconfigured."""
+    key = (key or "").strip()
+    if not key:
+        raise HTTPException(400, "key required")
+    priv = _require_signing()
+    try:
+        payload = keysign.parse_and_verify(keysign.public_key_hex(priv), key)
+    except Exception as exc:
+        raise HTTPException(403, f"license invalid: {exc}")
+    if int(payload.get("exp", 0)) < time.time():
+        raise HTTPException(403, "license expired")
+    kid = str(payload.get("kid") or "")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("SELECT revoked FROM issued_keys WHERE kid=?"), (kid,))
+        row = cur.fetchone()
+        cur.close()
+    if row and int(row[0]):
+        raise HTTPException(403, "license revoked")
+    return payload
+
+
+def _resolve_chat(payload: dict) -> str:
+    """The chat that paid for this license: issued key first, then the
+    order it was minted from (a key issued before the buyer tapped Start)."""
+    kid = str(payload.get("kid") or "")
+    order_id = ""
+    with get_db() as conn:
+        cur = conn.cursor()
+        if kid:
+            cur.execute(_sql("SELECT chat_id, order_id FROM issued_keys WHERE kid=?"),
+                        (kid,))
+            row = cur.fetchone()
+            if row:
+                if (row[0] or "").strip():
+                    cur.close()
+                    return str(row[0]).strip()
+                order_id = str(row[1] or "")
+        if order_id:
+            cur.execute(_sql("SELECT chat_id FROM orders WHERE order_id=?"),
+                        (order_id,))
+            row = cur.fetchone()
+            cur.close()
+            return str(row[0]).strip() if row else ""
+        cur.close()
+    return ""
+
+
+@app.post("/whoami")
+def whoami(body: dict):
+    """Which delivery chat belongs to this license? Fetched once at app boot
+    (also warms a sleeping Render instance)."""
+    payload = _verify_key(str(body.get("key") or ""))
+    return {"kid": str(payload["kid"]), "chat_id": _resolve_chat(payload),
+            "bot_username": tgpay.bot_username()}
+
+
+@app.post("/tg/send")
+def tg_send(body: dict):
+    """Relay ONE Telegram write for a licensed app through the shared bot.
+    op: push (new message) | edit | delete. The chat is resolved here —
+    the client never chooses where messages land."""
+    payload = _verify_key(str(body.get("key") or ""))
+    kid = str(payload["kid"])
+    _tg_rate(kid)
+    chat_id = _resolve_chat(payload)
+    if not chat_id:
+        raise HTTPException(409, "no linked chat — press “Link chat from "
+                                 "payment” in the app first")
+    op = str(body.get("op") or "push").strip().lower()
+    text = str(body.get("text") or "")
+    message_id = body.get("message_id")
+    if op == "edit":
+        if message_id in (None, ""):
+            return {"ok": False, "error": "message_id required for edit"}
+        return {"ok": bool(tgpay.edit_message(chat_id, message_id, text))}
+    if op == "delete":
+        if message_id in (None, ""):
+            return {"ok": False, "error": "message_id required for delete"}
+        return {"ok": bool(tgpay.delete_message(chat_id, message_id))}
+    mid = tgpay.send_message(chat_id, text)
+    if not mid:
+        return {"ok": False, "error": "telegram delivery failed"}
+    return {"ok": True,
+            "result": {"message_id": 0 if isinstance(mid, bool) else int(mid)}}
+
+
+@app.post("/link/status")
+def link_status(body: dict):
+    """App polls after opening t.me/<bot>?start=link_<nonce>. Consumes the
+    nonce (single use), stamps the chat on the license + order, returns it."""
+    payload = _verify_key(str(body.get("key") or ""))
+    nonce = str(body.get("nonce") or "").strip()[:64]
+    if not nonce:
+        raise HTTPException(400, "nonce required")
+    chat_id = ""
+    now = int(time.time())
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(_sql("SELECT chat_id, ts FROM link_challenges WHERE nonce=?"),
+                    (nonce,))
+        row = cur.fetchone()
+        if row and now - int(row[1] or 0) <= 600:
+            chat_id = str(row[0] or "").strip()
+            if chat_id:
+                kid = str(payload["kid"])
+                cur.execute(_sql("UPDATE issued_keys SET chat_id=? WHERE kid=?"),
+                            (chat_id, kid))
+                cur.execute(_sql(
+                    "UPDATE orders SET chat_id=? WHERE order_id IN "
+                    "(SELECT order_id FROM issued_keys WHERE kid=?)"),
+                    (chat_id, kid))
+        if row:
+            cur.execute(_sql("DELETE FROM link_challenges WHERE nonce=?"), (nonce,))
+        cur.close()
+    return {"chat_id": chat_id}
 
 
 # ── Admin ─────────────────────────────────────────────────────────

@@ -35,6 +35,7 @@ _thread: "threading.Thread | None" = None
 #   invoice_url(order_id, prev_key) -> str        ("" = could not create)
 #   link_chat(order_id, chat_id) -> None
 #   keys_by_chat(chat_id) -> [ {"kid", "key_str", "exp", "revoked"} ]
+#   link_nonce(nonce, chat_id) -> bool            (app links chat -> license)
 
 
 def _log(msg: str) -> None:
@@ -96,8 +97,10 @@ def deep_link(order_id: str) -> str:
     return f"https://t.me/{_username}?start=buy_{order_id}"
 
 
-def send_message(chat_id, text: str, button: "tuple[str, str] | None" = None) -> bool:
-    """Push a message (IPN thread -> buyer's chat). Long text is chunked."""
+def send_message(chat_id, text: str, button: "tuple[str, str] | None" = None):
+    """Push a message (IPN thread -> buyer's chat). Long text is chunked.
+    Returns the FIRST message's message_id (so live edits can follow), True
+    when all chunks landed without an id, or False on failure."""
     if not _token or chat_id in (None, ""):
         return False
     chunks = [c for c in (text or "").split("\n\n")] or [""]
@@ -118,6 +121,7 @@ def send_message(chat_id, text: str, button: "tuple[str, str] | None" = None) ->
     if cur:
         packed.append(cur)
     ok = True
+    first_id: "int | bool" = True
     for i, piece in enumerate(packed):
         payload: dict = {"chat_id": chat_id, "text": piece}
         if i == 0 and button:
@@ -127,7 +131,39 @@ def send_message(chat_id, text: str, button: "tuple[str, str] | None" = None) ->
         if not res.get("ok"):
             ok = False
             _log(f"sendMessage to {chat_id} failed: {res.get('description')}")
-    return ok
+        elif i == 0:
+            try:
+                first_id = int(res["result"]["message_id"])
+            except Exception:
+                first_id = True
+    if not ok:
+        return False
+    return first_id
+
+
+def edit_message(chat_id, message_id, text: str) -> bool:
+    """Rewrite an already-sent message (live answer growth). False = failed."""
+    if not _token or chat_id in (None, "") or message_id in (None, ""):
+        return False
+    res = _api("editMessageText",
+               {"chat_id": chat_id, "message_id": int(message_id),
+                "text": (text or "")[:MAX_MSG]}, timeout=30)
+    if not res.get("ok"):
+        _log(f"editMessageText {message_id} -> {chat_id} failed: {res.get('description')}")
+        return False
+    return True
+
+
+def delete_message(chat_id, message_id) -> bool:
+    """Retract a message (interviewer cut in). False = failed."""
+    if not _token or chat_id in (None, "") or message_id in (None, ""):
+        return False
+    res = _api("deleteMessage",
+               {"chat_id": chat_id, "message_id": int(message_id)}, timeout=30)
+    if not res.get("ok"):
+        _log(f"deleteMessage {message_id} -> {chat_id} failed: {res.get('description')}")
+        return False
+    return True
 
 
 # ── Long polling ──────────────────────────────────────────────────
@@ -178,6 +214,8 @@ def _handle(update: dict) -> None:
     if cmd in ("/start", "start"):
         if arg.startswith("buy_"):
             _handle_buy(chat_id, arg[4:])
+        elif arg.startswith("link_"):
+            _handle_link(chat_id, arg[5:])
         else:
             send_message(chat_id, _HELP)
     elif cmd in ("/mykeys", "mykeys"):
@@ -225,6 +263,25 @@ def _handle_buy(chat_id, order_id: str) -> None:
         "Pay with the button below. Your key is delivered to this chat as soon "
         "as the payment confirms.",
         button=("Open invoice", url))
+
+
+def _handle_link(chat_id, nonce: str) -> None:
+    """/start link_<nonce> — the app opened this deep link; confirm the chat
+    is now the delivery target for the license that requested the code."""
+    fn = _hooks.get("link_nonce")
+    nonce = (nonce or "").strip()[:64]
+    if not fn or not nonce:
+        send_message(chat_id, _HELP)
+        return
+    if fn(nonce, chat_id):
+        send_message(chat_id,
+                     "Linked.\n\nThis chat is now the delivery chat for your "
+                     "Interview Assistant license. Go back to the app — it "
+                     "confirms in a moment.")
+    else:
+        send_message(chat_id,
+                     "That link code is unknown or expired.\n\nIn the app, "
+                     "press “Link chat from payment” again for a fresh one.")
 
 
 def _send_key(chat_id, key_str: str, exp: int, order_id: str = "") -> None:
