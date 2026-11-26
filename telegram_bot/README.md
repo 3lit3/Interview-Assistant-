@@ -52,7 +52,7 @@ If you skip step 5, `setMyCommands` registers the same menu for you.
 | Variable | Required | Notes |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | The **second** bot token, not the app's token |
-| `TELEGRAM_WEBHOOK_SECRET` | Recommended | Random string, e.g. `python -c "import secrets;print(secrets.token_urlsafe(24))"` |
+| `TELEGRAM_WEBHOOK_SECRET` | Recommended | Random string of **A-Z a-z 0-9 `_` `-` only** (max 256 chars), e.g. `python -c "import secrets; print(secrets.token_urlsafe(24))"` — copy only the printed value. `+`, `/`, `=`, spaces and quotes make Telegram reject `setWebhook`. The service now sanitizes illegal characters automatically and reports failures at `/health`. |
 | `PUBLIC_URL` | Optional | Render's `RENDER_EXTERNAL_URL` is detected automatically; set this only for a custom domain |
 | `DOWNLOAD_URL` | Recommended | Direct HTTPS link to the ZIP |
 

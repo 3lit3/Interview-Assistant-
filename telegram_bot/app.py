@@ -42,7 +42,7 @@ logging.basicConfig(
 log = logging.getLogger("interview-assistant-bot")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+WEBHOOK_SECRET_RAW = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 PUBLIC_URL = (
     os.getenv("PUBLIC_URL", "").strip()
     or os.getenv("RENDER_EXTERNAL_URL", "").strip()
@@ -52,6 +52,27 @@ DOWNLOAD_FILE = os.getenv("DOWNLOAD_FILE", "").strip()
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR") or (Path(__file__).parent / "downloads"))
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 WEBHOOK_PATH = "/telegram/webhook"
+
+
+def _telegram_safe_secret(raw: str) -> str:
+    """Telegram secret_token allows only 1-256 chars of [A-Za-z0-9_-]."""
+    cleaned = "".join(
+        ch for ch in raw.strip().strip('"').strip("'")
+        if ch.isascii() and (ch.isalnum() or ch in "_-")
+    )
+    return cleaned[:256]
+
+
+WEBHOOK_SECRET = _telegram_safe_secret(WEBHOOK_SECRET_RAW)
+if WEBHOOK_SECRET_RAW and WEBHOOK_SECRET != WEBHOOK_SECRET_RAW:
+    log.warning(
+        "TELEGRAM_WEBHOOK_SECRET contained characters Telegram rejects "
+        "(+ / = spaces or quotes); sanitized it to a valid secret."
+    )
+
+WEBHOOK_REGISTERED = False
+WEBHOOK_ERROR: str | None = None
+LAST_TELEGRAM_ERROR: str | None = None
 
 # ── What users see when they open the bot / type a slash ──────────────────────
 
@@ -217,22 +238,28 @@ PAGE_LABELS = {
 
 def _api(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """One Bot API call. Failures are logged, never raised into the webhook."""
+    global LAST_TELEGRAM_ERROR
     if not BOT_TOKEN:
+        LAST_TELEGRAM_ERROR = "TELEGRAM_BOT_TOKEN is not set"
         log.warning("TELEGRAM_BOT_TOKEN missing; skipping %s", method)
         return None
     try:
         resp = requests.post(f"{API_BASE}/{method}", json=payload or {}, timeout=10)
     except requests.RequestException as exc:
+        LAST_TELEGRAM_ERROR = str(exc)
         log.warning("Telegram %s failed: %s", method, exc)
         return None
     try:
         data = resp.json()
     except ValueError:
+        LAST_TELEGRAM_ERROR = f"non-JSON response (HTTP {resp.status_code})"
         log.warning("Telegram %s returned non-JSON (HTTP %s)", method, resp.status_code)
         return None
     if not data.get("ok"):
-        log.warning("Telegram %s error: %s", method, data.get("description") or data)
+        LAST_TELEGRAM_ERROR = str(data.get("description") or data)
+        log.warning("Telegram %s error: %s", method, LAST_TELEGRAM_ERROR)
         return None
+    LAST_TELEGRAM_ERROR = None
     return data
 
 
@@ -435,8 +462,14 @@ def handle_callback(callback: dict[str, Any]) -> None:
 
 def configure_bot() -> None:
     """Register the command menu, bot description and webhook on every boot."""
+    global WEBHOOK_REGISTERED, WEBHOOK_ERROR, LAST_TELEGRAM_ERROR
+
+    WEBHOOK_REGISTERED = False
+    WEBHOOK_ERROR = None
+
     if not BOT_TOKEN:
-        log.warning("TELEGRAM_BOT_TOKEN is not set — the bot cannot answer yet")
+        WEBHOOK_ERROR = "TELEGRAM_BOT_TOKEN is not set"
+        log.warning("%s — the bot cannot answer yet", WEBHOOK_ERROR)
         return
 
     _api("setMyCommands", {"commands": BOT_COMMANDS, "language_code": "en"})
@@ -447,9 +480,10 @@ def configure_bot() -> None:
     )
 
     if not PUBLIC_URL:
+        WEBHOOK_ERROR = "PUBLIC_URL / RENDER_EXTERNAL_URL is not set"
         log.warning(
-            "PUBLIC_URL / RENDER_EXTERNAL_URL is not set — webhook was not registered. "
-            "Set PUBLIC_URL to the https:// URL of this service and restart."
+            "%s — webhook was not registered. Set PUBLIC_URL to the https:// URL "
+            "of this service and restart.", WEBHOOK_ERROR
         )
         return
 
@@ -459,9 +493,17 @@ def configure_bot() -> None:
     }
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
+    LAST_TELEGRAM_ERROR = None
     result = _api("setWebhook", payload)
     if result is not None:
+        WEBHOOK_REGISTERED = True
         log.info("Webhook registered at %s%s", PUBLIC_URL, WEBHOOK_PATH)
+    else:
+        WEBHOOK_ERROR = LAST_TELEGRAM_ERROR or "unknown setWebhook error"
+        log.error(
+            "Webhook registration FAILED: %s — Telegram will not deliver /start, "
+            "/help or /download until this is fixed.", WEBHOOK_ERROR
+        )
 
 
 @asynccontextmanager
@@ -470,14 +512,14 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="MARK LV Telegram Bot", lifespan=lifespan)
+app = FastAPI(title="Interview Assistant Telegram Bot", lifespan=lifespan)
 
 
 @app.get("/")
 def index() -> HTMLResponse:
     return HTMLResponse(
-        "<!doctype html><title>MARK LV Telegram Bot</title>"
-        "<h1>MARK LV Telegram Bot</h1>"
+        "<!doctype html><title>Interview Assistant Telegram Bot</title>"
+        "<h1>Interview Assistant Telegram Bot</h1>"
         "<p>Setup help and ZIP downloads for the interview assistant.</p>"
         "<p><a href='/health'>/health</a> · <a href='/download'>/download</a></p>"
     )
@@ -490,6 +532,8 @@ def health() -> JSONResponse:
         "bot_configured": bool(BOT_TOKEN),
         "webhook_url": f"{PUBLIC_URL}{WEBHOOK_PATH}" if PUBLIC_URL else None,
         "webhook_secret_set": bool(WEBHOOK_SECRET),
+        "webhook_registered": WEBHOOK_REGISTERED,
+        "webhook_error": WEBHOOK_ERROR,
         "download_url": download_url() or None,
     })
 
