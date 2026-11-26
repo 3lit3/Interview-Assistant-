@@ -76,19 +76,19 @@ LAST_TELEGRAM_ERROR: str | None = None
 
 # ── What users see when they open the bot / type a slash ──────────────────────
 
-BOT_SHORT_DESCRIPTION = "Setup help and downloads for the Interview Assistant by 3lit3."
+BOT_SHORT_DESCRIPTION = "Setup help, license info and downloads for the 3lit3 Interview Assistant app."
 
 BOT_DESCRIPTION = (
-    "A local, real-time interview answer assistant: whisper.cpp transcription, "
-    "OpenRouter answers, delivered to Telegram.\n"
-    "Use /help for setup, configuration and FAQs, and /download to get the ZIP."
+    "Setup help, license info and downloads for the 3lit3 Interview Assistant Windows app.\n"
+    "Use /help for installation, first-run setup, interview tips, payment details and FAQs, "
+    "and /download for the installer."
 )
 
 # Telegram shows this menu when the user taps the "Commands" button or types "/".
 BOT_COMMANDS = [
     {"command": "start", "description": "Welcome message and command list"},
-    {"command": "help", "description": "Setup, configuration and FAQs"},
-    {"command": "download", "description": "Get the Interview Assistant ZIP"},
+    {"command": "help", "description": "Setup, license and FAQs"},
+    {"command": "download", "description": "Get the Interview Assistant installer"},
 ]
 
 # ── Help content ──────────────────────────────────────────────────────────────
@@ -97,137 +97,198 @@ BOT_COMMANDS = [
 
 HELP_PAGES: dict[str, str] = {
     "start": (
-        "<b>👋 Welcome to Interview Assistant</b>\n\n"
-        "A local, real-time interview answer assistant by 3lit3. It captures audio, "
-        "transcribes with whisper.cpp, asks OpenRouter GPT-4.1-mini, and sends the "
-        "answer straight to Telegram.\n\n"
+        "<b>👋 Welcome to 3lit3 Interview Assistant</b>\n\n"
+        "A Windows interview assistant that listens, transcribes and suggests answers "
+        "while you interview. This bot gives you setup help, licensing details and "
+        "the installer.\n\n"
         "<b>Commands</b>\n"
         "/start — this welcome message\n"
-        "/help — setup, configuration and FAQs\n"
-        "/download — download the ZIP\n\n"
+        "/help — installation, first run, usage, payment and FAQs\n"
+        "/download — get the installer ZIP\n\n"
         "Tap a button below to begin."
     ),
     "home": (
-        "<b>📘 Interview Assistant — Help</b>\n\n"
-        "Pick a topic. Each page is short so it stays readable on a phone.\n\n"
+        "<b>📘 3lit3 Interview Assistant — Help</b>\n\n"
+        "Pick a topic. Every page is short so it stays readable on a phone.\n\n"
         "<b>Commands</b>\n"
         "/help — reopen this menu\n"
-        "/download — get the ZIP\n\n"
+        "/download — get the installer\n\n"
         "Tip: you can also tap <b>Download ZIP</b> below."
     ),
-    "setup": (
-        "<b>1 · Quick start (recommended variant)</b>\n\n"
-        "1. Download the ZIP and extract it.\n"
-        "2. Open a terminal in <code>Interview Assistant - whispercpp</code>.\n"
-        "3. <code>python -m venv win_env</code>, then activate it "
-        "(<code>.\\win_env\\Scripts\\Activate.ps1</code> on Windows).\n"
-        "4. <code>pip install -r requirements_whispercpp.txt</code>\n"
-        "5. Copy <code>.env.example</code> to <code>.env</code> and fill in your "
-        "keys (next page).\n"
-        "6. <code>python main.py --list-devices</code>, then "
-        "<code>python main.py --device &lt;INDEX&gt;</code>.\n\n"
-        "The stable <code>faster-whisper</code> build lives in "
-        "<code>Interview Assistant/</code> with its own requirements file."
-    ),
     "install": (
-        "<b>2 · Install &amp; audio routing</b>\n\n"
-        "<b>whisper.cpp variant (active)</b>\n"
-        "<code>pip install -r requirements_whispercpp.txt</code>\n\n"
-        "<b>Stable faster-whisper variant</b>\n"
-        "<code>pip install -r requirements.txt</code> inside "
-        "<code>Interview Assistant/</code>.\n\n"
-        "Check devices: <code>python main.py --list-devices</code>\n"
-        "Test routing: <code>python main.py --test-capture --device &lt;INDEX&gt;</code> "
-        "(records 5s, no STT/LLM/Telegram).\n\n"
-        "For system audio, choose a <b>Stereo Mix</b>, <b>What U Hear</b> or "
-        "<b>VB-Audio Virtual Cable</b> input and route playback into it. The first "
-        "STT run downloads model weights."
+        "<b>1 · Install</b>\n\n"
+        "<b>Requirements</b>\n"
+        "• Windows 10/11, 64-bit\n"
+        "• <b>No Python needed</b> — the runtime is bundled\n"
+        "• Microphone + speakers\n"
+        "• Internet + a <b>free Gemini API key</b>\n\n"
+        "<b>Steps</b>\n"
+        "1. Download and run <code>3lit3_Interview_Assistant.exe</code>.\n"
+        "2. Choose whether to add a desktop icon, then click <b>Install</b>.\n"
+        "3. No admin/UAC prompt — it installs per user to:\n"
+        "<code>%LocalAppData%\\Programs\\3lit3</code>\n"
+        "4. Launch it from the Start menu or desktop icon.\n\n"
+        "The console window showing the <code>[JARVIS]</code> transcript is intentional."
     ),
-    "req": (
-        "<b>3 · Configuration</b>\n\n"
-        "Create <code>.env</code> inside the variant folder:\n"
-        "<pre>OPENROUTER_API_KEY=...\n"
-        "TELEGRAM_BOT_TOKEN=...\n"
-        "TELEGRAM_CHAT_ID=...</pre>\n"
-        "Optional: <code>LLM_MODEL</code>, <code>STT_MODEL</code>, "
-        "<code>SILENCE_MS</code>, <code>CONTEXT_WINDOW</code>.\n\n"
-        "Common flags: <code>--mic</code>, <code>--loopback</code>, "
-        "<code>--device &lt;INDEX&gt;</code>, <code>--cv &lt;PATH&gt;</code>, "
-        "<code>--chat-id &lt;ID&gt;</code>.\n\n"
-        "Python 3.10+ is recommended; no GPU is required."
+    "first_run": (
+        "<b>2 · First run</b>\n\n"
+        "On first launch you will see:\n"
+        "<pre>◈  INITIALISATION REQUIRED\nConfigure J.A.R.V.I.S. before first boot.</pre>\n\n"
+        "1. Paste a free Gemini key from Google AI Studio (starts with <code>AIza…</code>).\n"
+        "2. Confirm the detected OS, or click Windows / macOS / Linux.\n"
+        "3. Click <b>▸ INITIALISE SYSTEMS</b>.\n\n"
+        "Settings are saved to:\n"
+        "<code>%LocalAppData%\\Programs\\3lit3\\config\\api_keys.json</code>\n\n"
+        "If the key is rejected, the setup screen reappears so you can replace it."
+    ),
+    "use": (
+        "<b>3 · Everyday use</b>\n\n"
+        "<b>Three ways to speak</b>\n"
+        "• Wake word: say <i>“Hey Jarvis”</i> (after enabling it)\n"
+        "• Push-to-talk: hold <code>Ctrl+Space</code>\n"
+        "• Type into the HUD input box and press Enter or <code>▸</code>\n\n"
+        "<b>Shortcuts</b>\n"
+        "<code>F4</code> mute/unmute · <code>F11</code> fullscreen · <code>Esc</code> interrupt\n\n"
+        "<b>Settings drawers</b>\n"
+        "⚙ SETUP: remote control, Telegram, shortcut, auto-start, customise, audio "
+        "devices, memory, plugins.\n"
+        "🎛 CONTROLS: fullscreen, morning brief, wake word, sleep/wake, push-to-talk, "
+        "HUD style.\n\n"
+        "Click a header again to close the drawer."
+    ),
+    "interview": (
+        "<b>4 · Interview mode</b>\n\n"
+        "1. Under <b>CV UPLOAD</b>, choose your CV (.pdf, .docx, .doc, .txt, .md).\n"
+        "2. Under <b>INTERVIEW CONTEXT</b>, type the role/company/topic and click "
+        "<code>▸</code>.\n"
+        "3. Suggested answers appear in <b>AI SUGGESTIONS &amp; FEEDBACK</b> as text.\n"
+        "4. Use <b>✋ INTERRUPT [ESC]</b> or the mic button to go quiet.\n\n"
+        "Answers are text-only by default so the interviewer cannot hear them. To hear "
+        "them, set <code>\"speak_answers\": true</code> in "
+        "<code>config\\api_keys.json</code> and restart.\n\n"
+        "For computer audio, switch <b>🔊 SYSTEM SOUND ON</b>. Set Windows' default "
+        "output to the stereo <b>Speakers (VB-Audio Virtual Cable)</b> device — not the "
+        "16-channel endpoint."
+    ),
+    "license": (
+        "<b>💳 License &amp; payment</b>\n\n"
+        "<b>Price:</b> $14.99 for <b>30 days</b>. One key works on <b>up to 2 devices</b>.\n\n"
+        "<b>How payment works</b>\n"
+        "1. In the app press <b>Buy</b>. It opens a chat with the <b>license bot</b> "
+        "and a deep link like <code>/start buy_&lt;order_id&gt;</code>.\n"
+        "2. The license bot links your chat to the order and sends an "
+        "<b>Open invoice</b> button (NowPayments).\n"
+        "3. Pay in the browser. NowPayments confirms by IPN, the server mints a signed "
+        "key, and the bot sends it to that chat.\n"
+        "4. The message includes a <code>myapp://license?key=...</code> link — tap it "
+        "to redeem in the app.\n"
+        "5. Send <code>/mykeys</code> to the <b>license bot</b> to see keys tied to "
+        "your chat.\n\n"
+        "<b>Important:</b> payment commands go to the license bot opened by the app — "
+        "not to this help bot. If you already paid, sending "
+        "<code>/start buy_&lt;order_id&gt;</code> to the license bot resends your key.\n\n"
+        "Activation uses the server once per device; everyday validation is offline, "
+        "so a Render restart cannot lock you out."
     ),
     "faq": (
         "<b>❓ FAQs</b>\n\n"
-        "<b>1.</b> Do I need a paid API key?\n"
-        "<b>2.</b> Which variant should I use?\n"
-        "<b>3.</b> How do I capture the interviewer's audio?\n"
-        "<b>4.</b> No answers arriving in Telegram\n"
-        "<b>5.</b> First run is slow / model download\n"
-        "<b>6.</b> Runtime commands + separate bot tokens\n\n"
+        "<b>1.</b> Do I need Python or admin rights?\n"
+        "<b>2.</b> Do I need a paid API key?\n"
+        "<b>3.</b> Where is the app installed?\n"
+        "<b>4.</b> Mic not detected / no suggestions\n"
+        "<b>5.</b> Can I hear answers aloud?\n"
+        "<b>6.</b> How do I capture computer audio?\n"
+        "<b>7.</b> Wake word not responding\n"
+        "<b>8.</b> Price, devices and payment\n\n"
         "Tap a number to read the answer."
     ),
     "faq:1": (
-        "<b>FAQ 1 · Do I need a paid API key?</b>\n\n"
-        "LLM calls go through OpenRouter using <code>openai/gpt-4.1-mini</code> by "
-        "default, so an OpenRouter API key is required. Check OpenRouter's current "
-        "free credit and pricing. Speech-to-text runs locally; only the question and "
-        "CV context are sent to the LLM. This bot never asks for your keys."
+        "<b>FAQ 1 · Python or admin rights?</b>\n\n"
+        "No. The installer bundles the Python runtime and installs per user without a "
+        "UAC prompt. You only need Python if you build from source. If Windows asks "
+        "for admin rights, you are running a different installer."
     ),
     "faq:2": (
-        "<b>FAQ 2 · Which variant should I use?</b>\n\n"
-        "<code>Interview Assistant - whispercpp</code> is the actively developed "
-        "variant: lower latency, <code>--test-capture</code>, and live CV reload over "
-        "Telegram. <code>Interview Assistant/</code> is the stable "
-        "<code>faster-whisper</code> baseline. Start with whispercpp."
+        "<b>FAQ 2 · Paid API key?</b>\n\n"
+        "No. Create a free Gemini key at "
+        "<a href=\"https://aistudio.google.com/app/apikey\">Google AI Studio</a>. It is "
+        "saved locally in <code>config\\api_keys.json</code> and is not bundled into "
+        "the installer. The license key is separate: $14.99 covers 30 days of app use "
+        "on up to 2 devices."
     ),
     "faq:3": (
-        "<b>FAQ 3 · How do I capture the interviewer's audio?</b>\n\n"
-        "Run <code>python main.py --list-devices</code>. For microphone mode use "
-        "<code>--mic</code>. For system audio use <code>--loopback</code> and pick a "
-        "Stereo Mix / What U Hear / VB-Audio Cable input; route the meeting's playback "
-        "into that cable. Verify with "
-        "<code>--test-capture --device &lt;INDEX&gt;</code>."
+        "<b>FAQ 3 · Where is the app installed?</b>\n\n"
+        "<code>%LocalAppData%\\Programs\\3lit3</code>. Press <code>Win + R</code>, "
+        "paste that path and press Enter. Your key, CV, memory and logs live there. "
+        "Uninstall deletes <code>config</code>, <code>memory</code> and <code>logs</code>, "
+        "so back up <code>api_keys.json</code> first."
     ),
     "faq:4": (
-        "<b>FAQ 4 · No answers arriving in Telegram</b>\n\n"
-        "Check <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_CHAT_ID</code> in "
-        "<code>.env</code> (or pass <code>--chat-id</code>). Send the bot a message "
-        "first, then restart the assistant. Answers are sent to that chat; in mic "
-        "mode the transcript is echoed too."
+        "<b>FAQ 4 · Mic or suggestions problem</b>\n\n"
+        "Choose the input under <b>⚙ → 🎧 AUDIO DEVICES</b>, check Windows microphone "
+        "privacy settings, and make sure <code>F4</code> has not muted it. If no "
+        "suggestions appear, confirm the CV loaded, add interview context and check "
+        "that <code>Esc</code> was not pressed."
     ),
     "faq:5": (
-        "<b>FAQ 5 · First run is slow / model download</b>\n\n"
-        "Normal. whisper.cpp / faster-whisper downloads its model weights on first "
-        "use. The default is <code>tiny.en</code>; change <code>STT_MODEL</code> in "
-        "<code>.env</code> or pass <code>--stt-model</code>. Later runs reuse the "
-        "cached model."
+        "<b>FAQ 5 · Hear answers aloud?</b>\n\n"
+        "Set <code>\"speak_answers\": true</code> in "
+        "<code>config\\api_keys.json</code> and restart. Keep <code>interview_mode</code> "
+        "at <code>true</code> for text-only interview mode. Video overlays start muted "
+        "— click <b>🔈 SOUND OFF</b> to unmute."
     ),
     "faq:6": (
-        "<b>FAQ 6 · Runtime commands and bot tokens</b>\n\n"
-        "While the assistant runs, message its bot: <code>/cv &lt;path&gt;</code> "
-        "reloads a CV, <code>/status</code> shows state, <code>/reset</code> clears "
-        "context; sending a .txt/.pdf/.docx document reloads the CV live.\n\n"
-        "<b>Important:</b> this help bot needs its <b>own token</b>. Telegram does "
-        "not allow a webhook and getUpdates polling on the same token — reusing the "
-        "desktop app's token would stop its commands working."
+        "<b>FAQ 6 · Capture computer audio?</b>\n\n"
+        "Set Windows' default output to the stereo <b>Speakers (VB-Audio Virtual "
+        "Cable)</b> device, not the 16-channel endpoint, then switch "
+        "<b>🔊 SYSTEM SOUND ON</b> in the app. The app handles echo and mic muting."
+    ),
+    "faq:7": (
+        "<b>FAQ 7 · Wake word not responding</b>\n\n"
+        "Install it from <b>🎛 → ⬇ WAKE WORD: DOWNLOAD</b>, or use "
+        "<b>Ctrl+Space</b> or <b>👂 WAKE NOW</b>. It sleeps after about two minutes "
+        "of silence by design."
+    ),
+    "faq:8": (
+        "<b>FAQ 8 · Price, devices and payment</b>\n\n"
+        "$14.99 gives you 30 days and up to 2 devices per key. Press <b>Buy</b> in the "
+        "app to open the license bot in Telegram; it sends a NowPayments invoice. "
+        "After payment the key and a <code>myapp://license?key=...</code> link are "
+        "delivered to that chat. Use <code>/mykeys</code> there to list your keys. "
+        "This help bot does not take payments."
     ),
     "download": (
-        "<b>⬇️ Download Interview Assistant</b>\n\n"
-        "Tap the button below to get the ZIP.\n\n"
+        "<b>⬇️ Download 3lit3 Interview Assistant</b>\n\n"
+        "Tap the button below to get the Windows installer/ZIP.\n\n"
         "If the link does not work, ask the admin to check the bot's "
         "<code>DOWNLOAD_URL</code> setting."
     ),
 }
 
-FAQ_COUNT = 6
-NEXT_PAGE = {"setup": "install", "install": "req", "req": "faq", "faq": "home"}
-PREV_PAGE = {"install": "setup", "req": "install", "faq": "req"}
+FAQ_COUNT = 8
+NEXT_PAGE = {
+    "install": "first_run",
+    "first_run": "use",
+    "use": "interview",
+    "interview": "license",
+    "license": "faq",
+    "faq": "home",
+}
+PREV_PAGE = {
+    "first_run": "install",
+    "use": "first_run",
+    "interview": "use",
+    "license": "interview",
+    "faq": "license",
+}
 
 PAGE_LABELS = {
     "home": "Help home",
-    "setup": "Setup",
-    "install": "Installation",
-    "req": "Requirements",
+    "install": "Install",
+    "first_run": "First run",
+    "use": "Everyday use",
+    "interview": "Interview mode",
+    "license": "License & payment",
     "faq": "FAQs",
     "download": "Download",
 }
@@ -332,8 +393,9 @@ def download_url() -> str:
 def keyboard_for(page: str) -> dict[str, Any]:
     if page in ("start", "home"):
         return _keyboard([
-            [_button("📘 Setup", "h:setup"), _button("⚙️ Installation", "h:install")],
-            [_button("✅ Requirements", "h:req"), _button("❓ FAQs", "h:faq")],
+            [_button("💿 Install", "h:install"), _button("🚀 First run", "h:first_run")],
+            [_button("🎮 Everyday use", "h:use"), _button("🎤 Interview mode", "h:interview")],
+            [_button("💳 License & payment", "h:license"), _button("❓ FAQs", "h:faq")],
             [_button("⬇️ Download ZIP", "h:download")],
         ])
 
@@ -364,7 +426,7 @@ def keyboard_for(page: str) -> dict[str, Any]:
         rows.append([_button("« Help home", "h:home")])
         return _keyboard(rows)
 
-    # Linear guide: setup → install → requirements → FAQs.
+    # Linear guide: install → first run → everyday use → interview → license → FAQs.
     row = []
     if page in PREV_PAGE:
         row.append(_button("◀ Back", f"h:{PREV_PAGE[page]}"))

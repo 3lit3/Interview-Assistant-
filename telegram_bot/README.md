@@ -76,20 +76,21 @@ Pick one:
 
 ## 4. How the paged help works
 
-`/help` sends one short menu with inline buttons:
+`/help` sends one short menu based on the Desktop `README.md` for `3lit3_Interview_Assistant.exe`:
 
 ```
-📘 Quick start       ⚙️ Installation
-✅ Configuration     ❓ FAQs
+💿 Install            🚀 First run
+🎮 Everyday use       🎤 Interview mode
+💳 License & payment  ❓ FAQs
 ⬇️ Download ZIP
 ```
 
-- **Quick start**, **Installation** and **Configuration** are separate short pages with **◀ Back / Next ▶** navigation, so no message hits Telegram's 4096-character limit.
-- **FAQs** has six numbered buttons. Each answer has **◀ Previous / Next ▶**, **All FAQs** and **« Help home** buttons.
+- **Install → First run → Everyday use → Interview mode → License & payment → FAQs** are separate short pages with **◀ Back / Next ▶** navigation, so no message hits Telegram's 4096-character limit.
+- **FAQs** has eight numbered buttons. Each answer has **◀ Previous / Next ▶**, **📋 All FAQs** and **« Help home** buttons.
 - Button presses edit the existing message with `editMessageText` instead of posting new ones, keeping the chat clean.
 - Every callback is answered (`answerCallbackQuery`) so the loading spinner stops.
 
-FAQ topics: API key / OpenRouter pricing, which variant to use, microphone vs system-audio capture, missing Telegram replies, first-run model download, and runtime commands plus the separate-token warning.
+FAQ topics: Python/admin rights, free Gemini key, install location, microphone/suggestion problems, spoken answers, system-audio capture (VB-Audio Cable), wake word, and licensing/payment. The help text documents the **$14.99 / 30 days / up to 2 devices** license and the Telegram payment flow: app **Buy** → license bot `/start buy_<order_id>` → NowPayments invoice → IPN → signed key delivered to chat with a `myapp://license?key=...` link; `/mykeys` lists keys for that chat. Payment commands belong to the **license bot**, not this help bot.
 
 To change wording or add FAQs, edit `HELP_PAGES`, `FAQ_COUNT` and `keyboard_for()` in `app.py`.
 
