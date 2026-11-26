@@ -1,0 +1,21 @@
+# Documentation for the Telegram help bot web service.
+#
+# This repository's live Render services are created through the dashboard, so
+# this file documents the settings. To deploy this bot: create a Web Service with
+# Root Directory = telegram_bot and use the values below. If you prefer a
+# Blueprint, copy this service entry into a render.yaml at the repository root
+# and add: rootDir: telegram_bot
+services:
+  - type: web
+    name: interview-assistant-help-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: DOWNLOAD_URL
+        sync: false
