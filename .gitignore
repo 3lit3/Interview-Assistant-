@@ -4,6 +4,7 @@
 # Keep only the Interview Assistant project folders and root docs
 !/Interview Assistant/
 !/Interview Assistant - whispercpp/
+!/telegram_bot/
 !/README.md
 !/.gitignore
 !/LICENSE
